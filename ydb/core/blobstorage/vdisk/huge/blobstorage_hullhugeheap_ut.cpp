@@ -1,4 +1,7 @@
 #include "blobstorage_hullhugeheap.h"
+
+#include <ydb/core/blobstorage/vdisk/common/vdisk_config.h>
+
 #include <library/cpp/testing/unittest/registar.h>
 
 #include <util/stream/null.h>
@@ -228,7 +231,7 @@ namespace NKikimr {
             ui32 overhead = 8;
             ui32 freeChunksReservation = 0;
             THeap heap("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, mileStoneBlobInBytes,
-                    maxBlobInBytes, overhead, freeChunksReservation);
+                    maxBlobInBytes, overhead, freeChunksReservation, nullptr, {});
             heap.FinishRecovery();
             ui32 hugeBlobSize = 6u << 20u;
 
@@ -253,7 +256,7 @@ namespace NKikimr {
             // just serialize/deserialize
             TString serialized = heap.Serialize();
             THeap newHeap("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, mileStoneBlobInBytes,
-                    maxBlobInBytes, overhead, freeChunksReservation);
+                    maxBlobInBytes, overhead, freeChunksReservation, nullptr, {});
             newHeap.ParseFromString(serialized);
             newHeap.FinishRecovery();
         }
@@ -297,7 +300,7 @@ namespace NKikimr {
             ui32 overhead = 8;
             ui32 freeChunksReservation = 0;
             THeap heap("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, minHugeBlobInBytes,
-                    maxBlobInBytes, overhead, freeChunksReservation);
+                    maxBlobInBytes, overhead, freeChunksReservation, nullptr, {});
             heap.FinishRecovery();
             TVector<THugeSlot> arr;
 
@@ -313,7 +316,7 @@ namespace NKikimr {
             ui32 overhead = 8;
             ui32 freeChunksReservation = 0;
             THeap heap("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, minHugeBlobInBytes,
-                    maxBlobInBytes, overhead, freeChunksReservation);
+                    maxBlobInBytes, overhead, freeChunksReservation, nullptr, {});
             heap.FinishRecovery();
             TVector<THugeSlot> arr;
 
@@ -322,7 +325,7 @@ namespace NKikimr {
             TString serialized = heap.Serialize();
             UNIT_ASSERT(THeap::CheckEntryPoint(serialized));
             THeap newHeap("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, minHugeBlobInBytes,
-                    maxBlobInBytes, overhead, freeChunksReservation);
+                    maxBlobInBytes, overhead, freeChunksReservation, nullptr, {});
             newHeap.ParseFromString(serialized);
             newHeap.FinishRecovery();
             TString heap2 = newHeap.ToString();
@@ -338,7 +341,7 @@ namespace NKikimr {
             ui32 overhead = 8;
             ui32 freeChunksReservation = 0;
             THeap heap("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, minHugeBlobInBytes,
-                    maxBlobInBytes, overhead, freeChunksReservation);
+                    maxBlobInBytes, overhead, freeChunksReservation, nullptr, {});
             heap.FinishRecovery();
 
             heap.RecoveryModeAddChunk(2);
@@ -368,7 +371,7 @@ namespace NKikimr {
             ui32 overhead = 8u;
             ui32 freeChunksReservation = 1;
             THeap heap("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, minHugeBlobInBytes,
-                    maxBlobInBytes, overhead, freeChunksReservation);
+                    maxBlobInBytes, overhead, freeChunksReservation, nullptr, {});
             heap.FinishRecovery();
 
             THugeSlot hugeSlot;
@@ -395,11 +398,11 @@ namespace NKikimr {
             ui32 freeChunksReservation = 0;
 
             THeap oldHeap("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, mileStoneBlobInBytes,
-                    maxBlobInBytes, overhead, freeChunksReservation);
+                    maxBlobInBytes, overhead, freeChunksReservation, nullptr, {});
             oldHeap.FinishRecovery();
 
             THeap fromHeap("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, mileStoneBlobInBytes,
-                    maxBlobInBytes, overhead, freeChunksReservation);
+                    maxBlobInBytes, overhead, freeChunksReservation, nullptr, {});
             fromHeap.ParseFromString(oldHeap.Serialize());
             fromHeap.FinishRecovery();
             TVector<THugeSlot> arr;
@@ -408,11 +411,188 @@ namespace NKikimr {
             TString serialized = fromHeap.Serialize();
             UNIT_ASSERT(THeap::CheckEntryPoint(serialized));
             THeap toHeap("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, mileStoneBlobInBytes,
-                    maxBlobInBytes, overhead, freeChunksReservation);
+                    maxBlobInBytes, overhead, freeChunksReservation, nullptr, {});
             toHeap.ParseFromString(serialized);
             toHeap.FinishRecovery();
             FreeScenary(toHeap, arr);
         }
+
+        Y_UNIT_TEST(AddArbitrarySlotSize) {
+            const ui32 appendBlockSize = 4064;
+            const ui32 diskSectorSize = 4_KB;
+            const ui32 chunkSize = 128_MB / diskSectorSize * appendBlockSize;
+            const ui32 minHugeBlobInBytes = appendBlockSize + 1;
+            const ui32 milestoneHugeBlobInBytes = 512_KB;
+            const ui32 maxBlobInBytes = 10_MB + 5 /* potential header size */;
+            const ui32 overhead = 8;
+            const ui32 freeChunksReservation = 0;
+
+            TVDiskConfig vdiskConfig{{
+                TVDiskIdShort(),
+                TActorId(),
+                0,
+                0,
+                NPDisk::EDeviceType::DEVICE_TYPE_NVME,
+                0,
+                NKikimrBlobStorage::TVDiskKind::Default,
+                1,
+                "static",
+            }};
+
+            const TBlobStorageGroupType gtype(TBlobStorageGroupType::ErasureNone);
+
+            std::vector<ui32> sizes;
+            for (ui32 i = minHugeBlobInBytes; i <= maxBlobInBytes; i += 5) {
+                sizes.push_back(i);
+            }
+
+            ui32 nextChunkIdx = 1;
+
+            std::vector<TDiskPart> hugeSlots;
+
+            THeap heap1("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, milestoneHugeBlobInBytes, maxBlobInBytes,
+                overhead, freeChunksReservation, &vdiskConfig, gtype);
+            heap1.FinishRecovery();
+            for (ui32 size : sizes) {
+                THugeSlot slot;
+                ui32 slotSize;
+                bool success = heap1.Allocate(size, &slot, &slotSize);
+                if (!success) {
+                    heap1.AddChunk(nextChunkIdx++);
+                    success = heap1.Allocate(size, &slot, &slotSize);
+                }
+                UNIT_ASSERT(success);
+                hugeSlots.push_back(TDiskPart(slot.GetChunkId(), slot.GetOffset(), size));
+            }
+
+            TString entrypoint = heap1.Serialize();
+
+            vdiskConfig.ExtraHugeSlots.push_back(1_MB);
+            vdiskConfig.ExtraHugeSlots.push_back(2_MB);
+            vdiskConfig.ExtraHugeSlots.push_back(3_MB);
+
+            THeap heap2("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, milestoneHugeBlobInBytes, maxBlobInBytes,
+                overhead, freeChunksReservation, &vdiskConfig, gtype);
+            heap2.ParseFromString(entrypoint);
+            heap2.FinishRecovery();
+            for (ui32 size : sizes) {
+                THugeSlot slot;
+                ui32 slotSize;
+                bool success = heap2.Allocate(size, &slot, &slotSize);
+                if (!success) {
+                    heap2.AddChunk(nextChunkIdx++);
+                    success = heap2.Allocate(size, &slot, &slotSize);
+                }
+                UNIT_ASSERT(success);
+                hugeSlots.push_back(TDiskPart(slot.GetChunkId(), slot.GetOffset(), size));
+            }
+            entrypoint = heap2.Serialize();
+
+            vdiskConfig.ExtraHugeSlots.clear();
+
+            THeap heap3("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, milestoneHugeBlobInBytes, maxBlobInBytes,
+                overhead, freeChunksReservation, &vdiskConfig, gtype);
+            heap3.ParseFromString(entrypoint);
+            heap3.FinishRecovery();
+            for (TDiskPart slot : hugeSlots) {
+                heap3.Free(slot);
+            }
+        }
+
+        Y_UNIT_TEST(AddArbitrarySlotSizeRandom) {
+            SetRandomSeed(1);
+
+            const ui32 appendBlockSize = 4064;
+            const ui32 diskSectorSize = 4_KB;
+            const ui32 chunkSize = 128_MB / diskSectorSize * appendBlockSize;
+            const ui32 minHugeBlobInBytes = appendBlockSize + 1;
+            const ui32 milestoneHugeBlobInBytes = 512_KB;
+            const ui32 maxBlobInBytes = 10_MB + 5 /* potential header size */;
+            const ui32 overhead = 8;
+            const ui32 freeChunksReservation = 0;
+
+            TVDiskConfig vdiskConfig{{
+                TVDiskIdShort(),
+                TActorId(),
+                0,
+                0,
+                NPDisk::EDeviceType::DEVICE_TYPE_NVME,
+                0,
+                NKikimrBlobStorage::TVDiskKind::Default,
+                1,
+                "static",
+            }};
+
+            const TBlobStorageGroupType gtype(TBlobStorageGroupType::ErasureNone);
+
+            std::vector<TDiskPart> hugeSlots;
+            std::optional<THeap> heap;
+            TString entrypoint;
+            ui32 nextChunkIdx = 1;
+
+            std::vector<ui32> specificSizes{
+                256_KB,
+                512_KB,
+                1024_KB,
+                2048_KB,
+                3072_KB,
+                4096_KB
+            };
+
+            for (ui32 i = 0; i < 100'000; ++i) {
+                if (!heap) {
+                    vdiskConfig.ExtraHugeSlots.clear();
+                    if (RandomNumber(2u)) { // add some extra slots
+                        vdiskConfig.ExtraHugeSlots.insert(vdiskConfig.ExtraHugeSlots.end(), specificSizes.begin(), specificSizes.end());
+                    }
+
+                    heap.emplace("vdisk", chunkSize, appendBlockSize, minHugeBlobInBytes, milestoneHugeBlobInBytes,
+                        maxBlobInBytes, overhead, freeChunksReservation, &vdiskConfig, gtype);
+                    if (entrypoint) {
+                        heap->ParseFromString(entrypoint);
+                    }
+                    heap->FinishRecovery();
+                }
+
+                const ui32 action = RandomNumber(4u);
+                if (action == 0) {
+                    Cerr << "restarting heap\n";
+                    if (heap) {
+                        entrypoint = heap->Serialize();
+                    }
+                    heap.reset();
+                } else if (action == 1) {
+                    Cerr << "freeing all huge slots\n";
+                    for (const TDiskPart& item : hugeSlots) {
+                        heap->Free(item);
+                    }
+                    hugeSlots.clear();
+                } else if (!hugeSlots.empty() && action == 2) {
+                    const size_t index = RandomNumber(hugeSlots.size());
+                    std::swap(hugeSlots[index], hugeSlots.back());
+                    Cerr << "freeing huge slot " << hugeSlots.back().ToString() << Endl;
+                    heap->Free(hugeSlots.back());
+                    hugeSlots.pop_back();
+                } else {
+                    const ui32 size = RandomNumber(2u)
+                        ? RandomNumber<ui32>(maxBlobInBytes - minHugeBlobInBytes + 1) + minHugeBlobInBytes
+                        : specificSizes[RandomNumber(specificSizes.size())];
+                    THugeSlot slot;
+                    ui32 slotSize;
+                    bool success = heap->Allocate(size, &slot, &slotSize);
+                    if (!success) {
+                        Cerr << "adding chunk " << nextChunkIdx << Endl;
+                        heap->AddChunk(nextChunkIdx++);
+                        success = heap->Allocate(size, &slot, &slotSize);
+                    }
+                    TDiskPart part(slot.GetChunkId(), slot.GetOffset(), size);
+                    Cerr << "allocated huge slot " << part.ToString() << Endl;
+                    UNIT_ASSERT(success);
+                    hugeSlots.push_back(part);
+                }
+            }
+        }
+
     }
 
 } // NKikimr

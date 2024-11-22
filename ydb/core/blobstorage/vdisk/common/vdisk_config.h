@@ -220,6 +220,7 @@ namespace NKikimr {
         bool EnableVDiskCooldownTimeout;
         TControlWrapper EnableVPatch = true;
         bool UseActorSystemTimeInBSQueue = false;
+        std::vector<ui32> ExtraHugeSlots;
 
         ///////////// BALANCING SETTINGS ////////////////////
         bool BalancingEnableSend = false;
@@ -264,6 +265,7 @@ namespace NKikimr {
 
         TVDiskConfig(const TBaseInfo &baseInfo);
         void Merge(const NKikimrBlobStorage::TVDiskConfig &update);
+
     private:
         // setup default borders for huge blobs depending on device type
         void SetupHugeBytes();

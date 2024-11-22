@@ -1,5 +1,8 @@
 #include "blobstorage_hullhugeheap.h"
 
+#include <ydb/core/blobstorage/vdisk/hulldb/base/blobstorage_blob.h>
+#include <ydb/core/blobstorage/vdisk/common/vdisk_config.h>
+
 #include <library/cpp/monlib/service/pages/templates.h>
 
 #include <ranges>
@@ -398,7 +401,9 @@ namespace NKikimr {
                 ui32 minHugeBlobInBytes,
                 ui32 milestoneBlobInBytes,
                 ui32 maxBlobInBytes,
-                ui32 overhead)
+                ui32 overhead,
+                const TVDiskConfig *vdiskConfig,
+                TBlobStorageGroupType gtype)
             : VDiskLogPrefix(vdiskLogPrefix)
             , ChunkSize(chunkSize)
             , AppendBlockSize(appendBlockSize)
@@ -415,7 +420,7 @@ namespace NKikimr {
                             << " MilestoneBlobInBytes# " << MilestoneBlobInBytes << " ChunkSize# " << ChunkSize
                             << " AppendBlockSize# " << AppendBlockSize << ")");
 
-            BuildChains();
+            BuildChains(vdiskConfig, gtype);
         }
 
         TChain *TAllChains::GetChain(ui32 size) {
@@ -602,7 +607,7 @@ namespace NKikimr {
         ////////////////////////////////////////////////////////////////////////////
         // TAllChains: Private
         ////////////////////////////////////////////////////////////////////////////
-        void TAllChains::BuildChains() {
+        void TAllChains::BuildChains(const TVDiskConfig *vdiskConfig, TBlobStorageGroupType gtype) {
             const ui32 startBlocks = MinHugeBlobInBlocks;
             const ui32 milestoneBlocks = MilestoneBlobInBytes / AppendBlockSize;
             const ui32 endBlocks = MaxHugeBlobInBlocks;
@@ -610,10 +615,33 @@ namespace NKikimr {
             NPrivate::TChainLayoutBuilder builder(startBlocks, milestoneBlocks, endBlocks, Overhead);
             const ui32 blocksInChunk = ChunkSize / AppendBlockSize;
 
+            std::vector<ui32> slotSizes;
+
             for (auto x : builder.GetLayout()) {
-                const ui32 slotSizeInBlocks = x.Right;
-                const ui32 slotSize = slotSizeInBlocks * AppendBlockSize;
-                const ui32 slotsInChunk = blocksInChunk / slotSizeInBlocks;
+                slotSizes.push_back(AppendBlockSize * x.Right /* slot size in blocks */);
+            }
+
+            if (vdiskConfig) {
+                for (ui32 blobSize : vdiskConfig->ExtraHugeSlots) {
+                    // maximum part size for specified user blob size
+                    const ui32 partSize = gtype.MaxPartSize(TBlobStorageGroupType::CrcModeNone, blobSize);
+                    // add header size
+                    const ui32 partSizeWithHeader = partSize + (vdiskConfig->AddHeader ? TDiskBlob::HeaderSize : 0);
+                    // calculate number of slots in chunk with part size aligned up to block size
+                    const ui32 aligned = partSizeWithHeader + AppendBlockSize - 1;
+                    const ui32 slotsInChunk = ChunkSize / (aligned - aligned % AppendBlockSize);
+                    // calculate optimal slot size
+                    slotSizes.push_back(blocksInChunk / slotsInChunk * AppendBlockSize);
+                }
+            }
+
+            std::ranges::sort(slotSizes);
+            const auto [begin, end] = std::ranges::unique(slotSizes);
+            slotSizes.erase(begin, end);
+
+            for (ui32 slotSize : slotSizes) {
+                Y_DEBUG_ABORT_UNLESS(slotSize % AppendBlockSize == 0);
+                const ui32 slotsInChunk = blocksInChunk / (slotSize / AppendBlockSize);
                 Chains.emplace_back(VDiskLogPrefix, slotsInChunk, slotSize);
             }
 
@@ -647,6 +675,18 @@ namespace NKikimr {
             return (size + AppendBlockSize - 1) / AppendBlockSize;
         }
 
+        TFreeRes TAllChains::Free(const TDiskPart& addr) {
+            const auto it = ChunkIdxToSlotSize.find(addr.ChunkIdx);
+            Y_ABORT_UNLESS(it != ChunkIdxToSlotSize.end());
+            TChain *chain = GetChain(it->second);
+            TFreeRes res = chain->Free(addr);
+            if (res.ChunkId) {
+                Y_ABORT_UNLESS(res.ChunkId == it->first);
+                ChunkIdxToSlotSize.erase(it);
+            }
+            return res;
+        }
+
         void TAllChains::FinishRecovery() {
             ui32 prevSlotSize = 0;
             for (const TChain& chain : Chains) {
@@ -654,6 +694,15 @@ namespace NKikimr {
                 prevSlotSize = chain.SlotSize;
             }
             BuildSearchTable();
+
+            // these sizes we know for sure
+            for (const TChain& chain : AllChains) {
+                chain.ForEachFreeSpaceChunk([&](const auto& x) {
+                    const auto& [chunkId, item] = x;
+                    const auto [it, inserted] = ChunkIdxToSlotSize.emplace(chunkId, chain.SlotSize);
+                    Y_ABORT_UNLESS(inserted);
+                });
+            }
         }
 
         void TAllChains::ShredNotify(const std::vector<ui32>& chunksToShred) {
@@ -674,12 +723,14 @@ namespace NKikimr {
                 ui32 mileStoneBlobInBytes,
                 ui32 maxBlobInBytes,
                 ui32 overhead,
-                ui32 freeChunksReservation)
+                ui32 freeChunksReservation,
+                const TVDiskConfig *vdiskConfig,
+                TBlobStorageGroupType gtype)
             : VDiskLogPrefix(vdiskLogPrefix)
             , FreeChunksReservation(freeChunksReservation)
             , FreeChunks()
             , Chains(vdiskLogPrefix, chunkSize, appendBlockSize, minHugeBlobInBytes, mileStoneBlobInBytes,
-                maxBlobInBytes, overhead)
+                maxBlobInBytes, overhead, vdiskConfig, gtype)
         {}
 
         //////////////////////////////////////////////////////////////////////////////////////////
@@ -707,12 +758,8 @@ namespace NKikimr {
             return true;
         }
 
-        TFreeRes THeap::Free(const TDiskPart &addr) {
-            ui32 size = addr.Size;
-            TChain *chain = Chains.GetChain(size);
-            Y_ABORT_UNLESS(chain);
-
-            TFreeRes res = chain->Free(chain->Convert(addr));
+        TFreeRes THeap::Free(const TDiskPart& addr) {
+            TFreeRes res = Chains.Free(addr);
             if (res.ChunkId) {
                 PutChunkIdToFreeChunks(res.ChunkId);
             }
@@ -746,6 +793,10 @@ namespace NKikimr {
 
         void THeap::FinishRecovery() {
             Chains.FinishRecovery();
+        }
+
+        void THeap::CalculateChunkSizes(const std::vector<TDiskPart>& hugeBlobList) {
+            Chains.CalculateChunkSizes(hugeBlobList);
         }
 
         THeapStat THeap::GetStat() const {
@@ -811,9 +862,7 @@ namespace NKikimr {
         }
 
         bool THeap::ReleaseSlot(THugeSlot slot) {
-            TChain* const chain = Chains.GetChain(slot.GetSize());
-            Y_VERIFY_S(chain, VDiskLogPrefix << "State# " << ToString() << " slot# " << slot.ToString());
-            if (TFreeRes res = chain->Free(chain->Convert(slot)); res.ChunkId) {
+            if (TFreeRes res = Chains.Free(slot.GetDiskPart()); res.ChunkId) {
                 PutChunkIdToFreeChunks(res.ChunkId);
                 return res.InLockedChunks;
             }
@@ -821,12 +870,12 @@ namespace NKikimr {
         }
 
         void THeap::OccupySlot(THugeSlot slot, bool inLockedChunks) {
-            TChain* const chain = Chains.GetChain(slot.GetSize());
-            Y_VERIFY_S(chain, VDiskLogPrefix << "State# " << ToString() << " slot# " << slot.ToString());
-            if (!chain->RecoveryModeAllocate(chain->Convert(slot))) {
+            TChain *chain = GetChain(slot.GetSize());
+            Y_ABORT_UNLESS(chain && chain->SlotSize == slot.GetSize());
+            if (!chain->RecoveryModeAllocate(slot.GetDiskPart())) {
                 const size_t numErased = FreeChunks.erase(slot.GetChunkId());
                 Y_VERIFY_S(numErased, VDiskLogPrefix << "State# " << ToString() << " slot# " << slot.ToString());
-                chain->RecoveryModeAllocate(chain->Convert(slot), slot.GetChunkId(), inLockedChunks);
+                chain->RecoveryModeAllocate(slot.GetDiskPart(), slot.GetChunkId(), inLockedChunks);
             }
         }
 

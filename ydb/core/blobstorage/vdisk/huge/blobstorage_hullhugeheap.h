@@ -11,6 +11,8 @@
 
 namespace NKikimr {
 
+    struct TVDiskConfig;
+
     namespace NHuge {
 
         // private structures
@@ -184,7 +186,9 @@ namespace NKikimr {
                 ui32 minHugeBlobInBytes,
                 ui32 milestoneBlobInBytes,
                 ui32 maxBlobInBytes,
-                ui32 overhead);
+                ui32 overhead,
+                const TVDiskConfig *vdiskConfig,
+                TBlobStorageGroupType gtype);
             // return a pointer to corresponding chain delegator by object byte size
             TChain *GetChain(ui32 size);
             const TChain *GetChain(ui32 size) const;
@@ -200,11 +204,13 @@ namespace NKikimr {
             // Builds a map of BlobSize -> THugeSlotsMap::TSlotInfo for THugeBlobCtx
             std::shared_ptr<THugeSlotsMap> BuildHugeSlotsMap() const;
 
+            TFreeRes Free(const TDiskPart& addr);
+
             void FinishRecovery();
             void ShredNotify(const std::vector<ui32>& chunksToShred);
 
         private:
-            void BuildChains();
+            void BuildChains(const TVDiskConfig *vdiskConfig, TBlobStorageGroupType gtype);
             void BuildSearchTable();
             inline ui32 SizeToBlocks(ui32 size) const;
 
@@ -218,7 +224,8 @@ namespace NKikimr {
             const ui32 MaxHugeBlobInBlocks;
             TDynBitMap DeserializedChains; // a bit mask of chains that were deserialized from the origin stream
             std::vector<TChain> Chains;
-            std::vector<ui16> SearchTable; // (NumFullBlocks - 1) -> Chain index
+            std::vector<ui16> SearchTable;
+            THashMap<ui32, ui32> ChunkIdxToSlotSize;
         };
 
 
@@ -250,7 +257,9 @@ namespace NKikimr {
                 ui32 maxBlobInBytes,
                 // difference between buckets is 1/overhead
                 ui32 overhead,
-                ui32 freeChunksReservation);
+                ui32 freeChunksReservation,
+                const TVDiskConfig *vdiskConfig,
+                TBlobStorageGroupType gtype);
 
 
             ui32 SlotNumberOfThisSize(ui32 size) const {
@@ -291,6 +300,7 @@ namespace NKikimr {
             bool ReleaseSlot(THugeSlot slot);
             void OccupySlot(THugeSlot slot, bool inLockedChunks);
             void FinishRecovery();
+            void CalculateChunkSizes(const std::vector<TDiskPart>& hugeBlobList);
 
             //////////////////////////////////////////////////////////////////////////////////////////
             // Serialize/Parse/Check

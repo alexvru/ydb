@@ -145,7 +145,7 @@ namespace NKikimr {
                 ReadLogCtx.reset();
                 // end
                 LocRecCtx->RecovInfo->FinishDispatching();
-                LocRecCtx->RepairedHuge->FinishRecovery(ctx);
+                LocRecCtx->RepairedHuge->FinishRecovery(ctx, MakeHugeBlobList());
                 VerifyOwnedChunks(ctx);
 
                 LocRecCtx->VCtx->LocalRecoveryErrorStr = "";
@@ -880,6 +880,54 @@ namespace NKikimr {
                     break;
             }
             Y_FAIL_S("Unexpected case: " << record.Signature.ToString());
+        }
+
+        std::vector<TDiskPart> MakeHugeBlobList() {
+            std::vector<TDiskPart> res;
+
+            // walk through index and extract blobs
+            auto hullds = LocRecCtx->HullDbRecovery->GetHullDs();
+            auto snap = hullds->LogoBlobs->GetIndexSnapshot();
+
+            using TLevelSliceSnapshot = NKikimr::TLevelSliceSnapshot<TKeyLogoBlob, TMemRecLogoBlob>;
+            using TLevelSegment = NKikimr::TLevelSegment<TKeyLogoBlob, TMemRecLogoBlob>;
+            using TFreshSegmentSnapshot = NKikimr::TFreshSegmentSnapshot<TKeyLogoBlob, TMemRecLogoBlob>;
+
+            TDiskDataExtractor extr;
+
+            auto processRecord = [&](const TMemRecLogoBlob& memRec, const TDiskPart *outbound) {
+                if (memRec.GetType() == TBlobType::HugeBlob || memRec.GetType() == TBlobType::ManyHugeBlobs) {
+                    memRec.GetDiskData(&extr, outbound);
+                    for (const TDiskPart *p = extr.Begin; p != extr.End; ++p) {
+                        if (!p->Empty()) {
+                            res.push_back(*p);
+                        }
+                    }
+                }
+            };
+
+            auto traverseFreshSeg = [&](const TFreshSegmentSnapshot& seg) {
+                typename TFreshSegmentSnapshot::TIteratorWOMerge it(hullds->HullCtx, &seg);
+                for (it.SeekToFirst(); it.Valid(); it.Next()) {
+                    processRecord(it.GetUnmergedMemRec(), nullptr);
+                }
+            };
+
+            auto& fresh = snap.FreshSnap;
+            traverseFreshSeg(fresh.Cur);
+            traverseFreshSeg(fresh.Dreg);
+            traverseFreshSeg(fresh.Old);
+
+            TLevelSliceSnapshot::TSstIterator it(&snap.SliceSnap);
+            for (it.SeekToFirst(); it.Valid(); it.Next()) {
+                TLevelSegment::TLevelSstPtr p = it.Get();
+                TLevelSegment::TMemIterator c(p.SstPtr.Get());
+                for (c.SeekToFirst(); c.Valid(); c.Next()) {
+                    processRecord(c->MemRec, c.GetOutbound());
+                }
+            }
+
+            return res;
         }
 
         void VerifyOwnedChunks(const TActorContext& ctx) {
