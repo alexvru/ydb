@@ -593,6 +593,286 @@ void DoPhantomWithOfflineDataCenterTest(EPhantomScenario scenario) {
         scenario == EPhantomScenario::Phantom ? NKikimrProto::NODATA : NKikimrProto::OK));
 }
 
+// Unlike the config-only tests, obtain OnlyPhantomsRemain from replication and
+// keep an acknowledged blob on the disks affected by the subsequent reassign.
+void DoReassignWithOfflineRealmAndPhantomsTest(bool delayStatusReports) {
+    constexpr ui32 offlineDataCenter = 2;
+    auto dataCenterOf = [](ui32 nodeId) { return (nodeId - 1) / 4; };
+    std::function<bool(ui32, std::unique_ptr<IEventHandle>&)> filterFunction;
+    TEnvironmentSetup env(TEnvironmentSetup::TSettings{
+        .NodeCount = 12,
+        .Erasure = TBlobStorageGroupType::ErasureMirror3dc,
+        .PrepareRuntime = [&](TTestActorSystem& runtime) { runtime.FilterFunction = filterFunction; },
+        .LocationGenerator = [](ui32 nodeId) {
+            NActorsInterconnect::TNodeLocation location;
+            location.SetDataCenter(ToString((nodeId - 1) / 4));
+            location.SetRack(ToString((nodeId - 1) % 4));
+            location.SetUnit("1");
+            return TNodeLocation(location);
+        },
+    });
+    env.CreateBoxAndPool(1, 1);
+    env.Sim(TDuration::Minutes(1));
+    env.UpdateSettings(false, false); // no self-heal or donor retaining the old target copy
+
+    const auto base = env.FetchBaseConfig();
+    UNIT_ASSERT_VALUES_EQUAL(base.GroupSize(), 1);
+    const ui32 groupId = base.GetGroup(0).GetGroupId();
+    const auto info = env.GetGroupInfo(groupId);
+    const TString data = "acknowledged data must survive reassign";
+    const TLogoBlobID phantomId(1, 1, 1, 0, data.size(), 0);
+    std::optional<TVDiskID> formattedDisk;
+    std::optional<TVDiskID> targetDisk;
+    for (ui32 part = 0; part < 3; ++part) {
+        const auto disk = info->GetVDiskInSubgroup(part, phantomId.Hash());
+        switch (dataCenterOf(info->GetActorId(disk).NodeId())) {
+            case 0: formattedDisk = disk; break;
+            case 1: targetDisk = disk; break;
+        }
+    }
+    UNIT_ASSERT(formattedDisk && targetDisk);
+    const ui32 formattedNode = info->GetActorId(*formattedDisk).NodeId();
+    const ui32 targetNode = info->GetActorId(*targetDisk).NodeId();
+
+    // The two blobs must use the same main replicas. In particular, replacing
+    // targetDisk removes a real copy, rather than an unrelated empty slot.
+    TLogoBlobID committedId;
+    for (ui32 step = 1; step <= 100000; ++step) {
+        const TLogoBlobID candidate(2, 1, step, 0, data.size(), 0);
+        bool same = true;
+        for (ui32 part = 0; part < 3; ++part) {
+            same &= info->GetVDiskInSubgroup(part, candidate.Hash()) ==
+                info->GetVDiskInSubgroup(part, phantomId.Hash());
+        }
+        if (same) {
+            committedId = candidate;
+            break;
+        }
+    }
+    UNIT_ASSERT(committedId.TabletID());
+    const ui32 phantomPart = info->GetIdxInSubgroup(*formattedDisk, phantomId.Hash()) + 1;
+    env.PutBlob(*formattedDisk, TLogoBlobID(phantomId, phantomPart), data);
+    env.PutBlob(groupId, committedId, data); // ordinary TEvPut, asserts client OK
+    for (ui32 part = 0; part < 3; ++part) {
+        const auto disk = info->GetVDiskInSubgroup(part, committedId.Hash());
+        env.CheckBlob(info->GetActorId(disk), disk, TLogoBlobID(committedId, part + 1), data);
+    }
+    {
+        const auto edge = env.Runtime->AllocateEdgeActor(1, __FILE__, __LINE__);
+        env.Runtime->WrapInActorContext(edge, [&] {
+            SendToBSProxy(edge, groupId, new TEvBlobStorage::TEvCollectGarbage(phantomId.TabletID(), 1, 0, 0,
+                true, 1, Max<ui32>(), new TVector<TLogoBlobID>(1, phantomId), nullptr, TInstant::Max(), false));
+        });
+        const auto res = env.WaitForEdgeActorEvent<TEvBlobStorage::TEvCollectGarbageResult>(edge);
+        UNIT_ASSERT_VALUES_EQUAL(res->Get()->Status, NKikimrProto::OK);
+    }
+    env.Sim(TDuration::Minutes(30)); // spread keep/barrier and ingress before losing the sole phantom copy
+
+    auto vdiskIdFromSlot = [](const NKikimrBlobStorage::TBaseConfig::TVSlot& slot) {
+        return TVDiskID(slot.GetGroupId(), slot.GetGroupGeneration(), slot.GetFailRealmIdx(),
+            slot.GetFailDomainIdx(), slot.GetVDiskIdx());
+    };
+    NKikimrBlobStorage::TBaseConfig::TVSlot formattedSlot;
+    NKikimrBlobStorage::TBaseConfig::TVSlot targetSlot;
+    for (const auto& slot : base.GetVSlot()) {
+        if (slot.GetGroupId() == groupId) {
+            if (vdiskIdFromSlot(slot) == *formattedDisk) {
+                formattedSlot = slot;
+            } else if (vdiskIdFromSlot(slot) == *targetDisk) {
+                targetSlot = slot;
+            }
+        }
+    }
+    UNIT_ASSERT(formattedSlot.HasVSlotId() && targetSlot.HasVSlotId());
+    bool onlyPhantoms = false;
+    bool holdReports = false;
+    std::vector<std::pair<ui32, std::unique_ptr<IEventHandle>>> heldReports;
+    filterFunction = [&](ui32 nodeId, std::unique_ptr<IEventHandle>& ev) {
+        if (ev->GetTypeRewrite() == TEvBlobStorage::EvStatusUpdate) {
+            const auto* status = ev->Get<TEvStatusUpdate>();
+            const auto& slot = formattedSlot.GetVSlotId();
+            if (status->NodeId == slot.GetNodeId() && status->PDiskId == slot.GetPDiskId() &&
+                    status->VSlotId == slot.GetVSlotId()) {
+                onlyPhantoms = status->Status == NKikimrBlobStorage::REPLICATING && status->OnlyPhantomsRemain;
+            }
+        }
+        // Delay the entire stream of reports from this node, including later
+        // reports. Do not fabricate statuses or let a newer report overtake it.
+        if (holdReports && ev->GetTypeRewrite() == TEvBlobStorage::TEvControllerUpdateDiskStatus::EventType &&
+                ev->Sender.NodeId() == formattedNode) {
+            heldReports.emplace_back(nodeId, std::move(ev));
+            return false;
+        }
+        return true;
+    };
+    env.Cleanup();
+    const auto& formattedSlotId = formattedSlot.GetVSlotId();
+    env.PDiskMockStates.at({formattedNode, formattedSlotId.GetPDiskId()}).Reset();
+    env.Initialize();
+    for (ui32 node = 9; node <= 12; ++node) {
+        env.StopNode(node);
+    }
+
+    auto waitFor = [&](auto&& condition, const char* explanation) {
+        const auto deadline = env.Runtime->GetClock() + TDuration::Minutes(360);
+        while (!condition() && env.Runtime->GetClock() < deadline) {
+            env.Sim(TDuration::Seconds(1));
+        }
+        UNIT_ASSERT_C(condition(), explanation);
+    };
+    auto controllerPhantomOnly = [&] {
+        const auto edge = env.Runtime->AllocateEdgeActor(1, __FILE__, __LINE__);
+        env.Runtime->SendToPipe(env.TabletId, edge, new NSysView::TEvSysView::TEvGetVSlotsRequest, 0,
+            TTestActorSystem::GetPipeConfigWithRetries());
+        const auto response = env.WaitForEdgeActorEvent<NSysView::TEvSysView::TEvGetVSlotsResponse>(edge);
+        for (const auto& entry : response->Get()->Record.GetEntries()) {
+            const auto& key = entry.GetKey();
+            if (key.GetNodeId() == formattedSlotId.GetNodeId() && key.GetPDiskId() == formattedSlotId.GetPDiskId() &&
+                    key.GetVSlotId() == formattedSlotId.GetVSlotId()) {
+                return entry.GetInfo().GetPhantomOnly();
+            }
+        }
+        return false;
+    };
+    waitFor([&] { return onlyPhantoms && controllerPhantomOnly(); }, "replication did not report phantoms only");
+    const ui32 committedPart = info->GetIdxInSubgroup(*formattedDisk, committedId.Hash()) + 1;
+    env.CheckBlob(info->GetActorId(*formattedDisk), *formattedDisk,
+        TLogoBlobID(committedId, committedPart), data); // recovered despite the offline realm
+
+    if (delayStatusReports) {
+        holdReports = true;
+        env.StopNode(targetNode);
+        waitFor([&] { return !onlyPhantoms && !heldReports.empty(); }, "no changed replication status was detained");
+        UNIT_ASSERT_C(controllerPhantomOnly(), "controller must still see the old phantoms-only report");
+    }
+    // Check actual BSC readiness after node disconnects, rather than supplying
+    // synthetic ERROR reports as the config-only tests do.
+    waitFor([&] {
+        const auto current = env.FetchBaseConfig();
+        ui32 offlineSlots = 0;
+        bool targetNotReady = !delayStatusReports;
+        for (const auto& slot : current.GetVSlot()) {
+            if (slot.GetGroupId() != groupId) {
+                continue;
+            }
+            if (dataCenterOf(slot.GetVSlotId().GetNodeId()) == offlineDataCenter) {
+                if (slot.GetReady()) {
+                    return false;
+                }
+                ++offlineSlots;
+            }
+            const auto disk = vdiskIdFromSlot(slot);
+            if (disk == *targetDisk && delayStatusReports) {
+                targetNotReady = !slot.GetReady();
+            } else if (dataCenterOf(slot.GetVSlotId().GetNodeId()) != offlineDataCenter &&
+                    disk != *formattedDisk && !slot.GetReady()) {
+                return false; // also wait for the healthy slots' stable READY interval after restart
+            }
+        }
+        return offlineSlots == 3 && targetNotReady;
+    }, "BSC did not observe the stopped nodes");
+
+    // Use a spare node in the target realm, never a disk in the offline realm
+    // or on the stopped target node. There are four nodes per realm, three used.
+    std::set<ui32> usedNodes;
+    for (const auto& slot : base.GetVSlot()) {
+        if (slot.GetGroupId() == groupId) {
+            usedNodes.insert(slot.GetVSlotId().GetNodeId());
+        }
+    }
+    ui32 spareNode = 5;
+    while (spareNode <= 8 && usedNodes.contains(spareNode)) {
+        ++spareNode;
+    }
+    UNIT_ASSERT(spareNode <= 8);
+    NKikimrBlobStorage::TConfigRequest request;
+    request.SetIgnoreGroupReserve(true);
+    request.SetAllowUnusableDisks(true);
+    request.SetIgnoreDegradedGroupsChecks(true);
+    auto* reassign = request.AddCommand()->MutableReassignGroupDisk();
+    reassign->SetGroupId(groupId);
+    reassign->SetGroupGeneration(targetSlot.GetGroupGeneration());
+    reassign->SetFailRealmIdx(targetSlot.GetFailRealmIdx());
+    reassign->SetFailDomainIdx(targetSlot.GetFailDomainIdx());
+    reassign->SetVDiskIdx(targetSlot.GetVDiskIdx());
+    for (const auto& pdisk : base.GetPDisk()) {
+        if (pdisk.GetNodeId() == spareNode) {
+            reassign->MutableTargetPDiskId()->SetNodeId(spareNode);
+            reassign->MutableTargetPDiskId()->SetPDiskId(pdisk.GetPDiskId());
+            break;
+        }
+    }
+    UNIT_ASSERT(reassign->HasTargetPDiskId());
+    if (!delayStatusReports) {
+        // The new flag does not bypass the independent ExpectedStatus guard.
+        // Unlike the stopped-target case, moving a healthy target changes it.
+        auto guardedRequest = request;
+        guardedRequest.SetTreatPhantomsOnlyVDisksAsWorking(true);
+        guardedRequest.SetRollback(true);
+        const auto guarded = env.Invoke(guardedRequest);
+        UNIT_ASSERT_C(!guarded.GetRollbackSuccess() && guarded.GroupsGetDisintegratedByExpectedStatusSize(),
+            guarded.DebugString());
+    }
+    // Reach the real replacement with the explicit ExpectedStatus override,
+    // while keeping the failure-model check enabled in both requests below.
+    request.SetIgnoreDisintegratedGroupsChecks(true);
+    UNIT_ASSERT(!request.GetIgnoreGroupFailModelChecks());
+    const auto rejected = env.Invoke(request);
+    UNIT_ASSERT_C(!rejected.GetSuccess() && rejected.GroupsGetDisintegratedSize(), rejected.DebugString());
+    request.SetTreatPhantomsOnlyVDisksAsWorking(true);
+    const auto accepted = env.Invoke(request);
+    UNIT_ASSERT_C(accepted.GetSuccess(), accepted.DebugString());
+
+    const auto updated = env.FetchBaseConfig();
+    bool moved = false;
+    for (const auto& slot : updated.GetVSlot()) {
+        if (slot.GetGroupId() == groupId && slot.GetFailRealmIdx() == targetSlot.GetFailRealmIdx() &&
+                slot.GetFailDomainIdx() == targetSlot.GetFailDomainIdx() && slot.GetVDiskIdx() == targetSlot.GetVDiskIdx()) {
+            UNIT_ASSERT_VALUES_EQUAL(slot.GetVSlotId().GetNodeId(), spareNode);
+            UNIT_ASSERT_VALUES_EQUAL(slot.DonorsSize(), 0);
+            moved = true;
+        }
+    }
+    UNIT_ASSERT(moved);
+    auto checkData = [&] {
+        const auto edge = env.Runtime->AllocateEdgeActor(1, __FILE__, __LINE__);
+        env.Runtime->WrapInActorContext(edge, [&] {
+            SendToBSProxy(edge, groupId, new TEvBlobStorage::TEvGet(committedId, 0, 0, TInstant::Max(),
+                NKikimrBlobStorage::FastRead));
+        });
+        const auto result = env.WaitForEdgeActorEvent<TEvBlobStorage::TEvGetResult>(edge);
+        UNIT_ASSERT_VALUES_EQUAL(result->Get()->Status, NKikimrProto::OK);
+        UNIT_ASSERT_VALUES_EQUAL(result->Get()->ResponseSz, 1);
+        UNIT_ASSERT_VALUES_EQUAL(result->Get()->Responses[0].Status, NKikimrProto::OK);
+        UNIT_ASSERT_VALUES_EQUAL(result->Get()->Responses[0].Buffer.ConvertToString(), data);
+    };
+    env.Sim(TDuration::Minutes(1)); // propagate the new group generation
+    checkData(); // the offline realm cannot rescue a failed replacement
+    holdReports = false;
+    for (auto& [nodeId, event] : heldReports) {
+        env.Runtime->Send(event.release(), nodeId);
+    }
+    if (delayStatusReports) {
+        env.StartNode(targetNode);
+    }
+    for (ui32 node = 9; node <= 12; ++node) {
+        env.StartNode(node);
+    }
+    env.Sim(TDuration::Minutes(30));
+    checkData();
+    waitFor([&] {
+        const auto current = env.FetchBaseConfig();
+        ui32 ready = 0;
+        for (const auto& slot : current.GetVSlot()) {
+            if (slot.GetGroupId() == groupId && slot.GetReady()) {
+                ++ready;
+            }
+        }
+        return ready == 9;
+    }, "the group did not finish replication after the realm returned");
+    checkData();
+}
+
 Y_UNIT_TEST_SUITE(Replication) {
     Y_UNIT_TEST(Phantoms_mirror3dc) { DoTest(TBlobStorageGroupType::ErasureMirror3dc); }
     // Fork the 168 placements by formatted disk to keep each test below the timeout.
@@ -613,6 +893,14 @@ Y_UNIT_TEST_SUITE(Replication) {
 
     Y_UNIT_TEST(ReplStuck_mirror3dc) {
         DoTestCase(TBlobStorageGroupType::ErasureMirror3dc, {E::OK, E::FORMAT, E::OK, E::OK, E::OFFLINE, E::OK, E::OK, E::OFFLINE, E::OK}, true);
+    }
+
+    Y_UNIT_TEST(ReassignWithOfflineRealmAndPhantoms_mirror3dc) {
+        DoReassignWithOfflineRealmAndPhantomsTest(false);
+    }
+
+    Y_UNIT_TEST(ReassignWithOfflineRealmAndStalePhantomsStatus_mirror3dc) {
+        DoReassignWithOfflineRealmAndPhantomsTest(true);
     }
 
     Y_UNIT_TEST(PhantomWithOfflineDataCenter_mirror3dc) {
