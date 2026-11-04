@@ -94,6 +94,7 @@ void TNodeWarden::ApplyServiceSet(const NKikimrBlobStorage::TNodeWardenServiceSe
         to->Clear();
     }
     MergeServiceSetPDisks(to, serviceSet.GetPDisks(), pdisksToRestart);
+    PrunePendingPDisks();
 
     UpdateBlobStorageExecutorPoolMapping();
     for (const TServiceSetPDisk& pdisk : pdisksToRestart) {

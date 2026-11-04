@@ -2072,98 +2072,378 @@ Y_UNIT_TEST_SUITE(TBlobStorageWardenTest) {
         }
     }
 
-    void CheckVDiskStartWithUnavailablePDisk(bool pathCollision) {
-        using TWarden = NStorage::TNodeWarden;
-        using TPeer = NStorage::TNodeWardenTestPeer;
-        using TFailRealm = NKikimrBlobStorage::TGroupInfo::TFailRealm;
-        TTestActorSystem runtime(1, NLog::PRI_ERROR, MakeIntrusive<TDomainsInfo>());
-        const auto wardenId = SetupNodeWardenForSlayTest(runtime);
-        const TWarden::TVSlotId oldSlot(1, 1, 1);
-        const TWarden::TVSlotId newSlot(1, 1000, 1);
-        const TVDiskID vdiskId(100596, 1, 1, 0, 0);
-        const TString path = "/unused-pdisk-path-collision-test";
-
-        runtime.WrapInActorContext(wardenId, [&](IActor* actor) {
-            auto& warden = *static_cast<TWarden*>(actor);
-            if (pathCollision) {
-                auto& oldPDisk = TPeer::AddPDisk(warden, oldSlot.PDiskId);
-                oldPDisk.SetNodeID(1);
-                oldPDisk.SetPDiskID(oldSlot.PDiskId);
-                oldPDisk.SetPath(path);
-                oldPDisk.SetPDiskGuid(123);
-                TPeer::TrackPath(warden, oldSlot.PDiskId);
-                // The old incarnation still owns this path when the new service set arrives.
-                SetSlayTestVDisk(warden.LocalVDisks[oldSlot], 1, oldSlot.PDiskId, 1,
-                    TVDiskID(100595, 1, 0, 0, 0));
-            }
-
-            NKikimrBlobStorage::TNodeWardenServiceSet incoming;
-            NKikimrBlobStorage::TNodeWardenServiceSet::TPDisk newPDisk;
-            newPDisk.SetNodeID(1);
-            newPDisk.SetPDiskID(newSlot.PDiskId);
-            newPDisk.SetPath(path);
-            newPDisk.SetPDiskGuid(456);
-            if (pathCollision) {
-                incoming.AddPDisks()->CopyFrom(newPDisk);
-            }
-            auto* vdisk = incoming.AddVDisks();
-            VDiskIDFromVDiskID(vdiskId, vdisk->MutableVDiskID());
-            auto* location = vdisk->MutableVDiskLocation();
-            location->SetNodeID(1);
-            location->SetPDiskID(newSlot.PDiskId);
-            location->SetVDiskSlotID(newSlot.VDiskSlotId);
-            location->SetPDiskGuid(newPDisk.GetPDiskGuid());
-
-            warden.ApplyStaticServiceSet(incoming);
-            UNIT_ASSERT(!warden.LocalVDisks.at(newSlot).RuntimeData);
-            UNIT_ASSERT(warden.VDiskIdByActor.empty());
-            if (pathCollision) {
-                UNIT_ASSERT_VALUES_EQUAL(TPeer::GetPDisk(warden, oldSlot.PDiskId).GetPDiskGuid(), 123);
-                warden.LocalVDisks.erase(oldSlot);
-                warden.DestroyLocalPDisk(oldSlot.PDiskId);
-            }
-
-            // Supply the missing dependency and replay the VDisk configuration. Use a failed
-            // realm's error-state actor so the test needs no physical disk or recovery I/O.
-            TPeer::AddPDisk(warden, newSlot.PDiskId).CopyFrom(newPDisk);
-            TPeer::TrackPath(warden, newSlot.PDiskId);
-            auto& group = warden.Groups[vdiskId.GroupID.GetRawId()];
-            group.Group.emplace();
-            TBlobStorageGroupInfo::TDynamicInfo dynamic(vdiskId.GroupID, 1);
-            dynamic.FailRealmStates = {TFailRealm::N0, TFailRealm::F, TFailRealm::N0};
-            for (ui32 i = 0; i < 9; ++i) {
-                dynamic.PushBackActorId(newSlot.GetVDiskServiceId());
-            }
-            group.Info = MakeIntrusive<TBlobStorageGroupInfo>(TBlobStorageGroupInfo::TTopology(
-                TBlobStorageGroupType::ErasureMirror3dc, 3, 3, 1), std::move(dynamic), "");
-            warden.ApplyLocalVDiskInfo(*vdisk);
-            UNIT_ASSERT(warden.LocalVDisks.at(newSlot).RuntimeData);
-            UNIT_ASSERT_VALUES_EQUAL(warden.VDiskIdByActor.size(), 1);
-        });
-
+    void WaitForErrorStateVDisk(TTestActorSystem& runtime, TActorId wardenId,
+            NStorage::TNodeWarden::TVSlotId slot, const TVDiskID& vdiskId) {
         const auto deadline = runtime.GetClock() + TDuration::Seconds(5);
         runtime.Sim([&] {
             UNIT_ASSERT(runtime.GetClock() < deadline);
             bool ready = false;
             runtime.WrapInActorContext(wardenId, [&](IActor* actor) {
-                const auto& warden = *static_cast<TWarden*>(actor);
-                ready = warden.LocalVDisks.at(newSlot).Status == NKikimrBlobStorage::EVDiskStatus::ERROR;
+                const auto& warden = *static_cast<NStorage::TNodeWarden*>(actor);
+                ready = warden.LocalVDisks.at(slot).Status == NKikimrBlobStorage::EVDiskStatus::ERROR;
             });
             return !ready;
         });
         const auto edge = runtime.AllocateEdgeActor(1);
-        runtime.Send(new IEventHandle(newSlot.GetVDiskServiceId(), edge,
+        runtime.Send(new IEventHandle(slot.GetVDiskServiceId(), edge,
             new TEvBlobStorage::TEvVStatus(vdiskId)), 1);
         const auto response = runtime.WaitForEdgeActorEvent<TEvBlobStorage::TEvVStatusResult>(edge, false);
         UNIT_ASSERT_VALUES_EQUAL(response->Get()->Record.GetStatus(), NKikimrProto::VDISK_ERROR_STATE);
     }
 
-    CUSTOM_UNIT_TEST(TestVDiskStartWithMissingPDisk) {
-        CheckVDiskStartWithUnavailablePDisk(false);
+    struct TPDiskPathCollisionFixture {
+        using TWarden = NStorage::TNodeWarden;
+        using TServiceSet = NKikimrBlobStorage::TNodeWardenServiceSet;
+        using TReport = NKikimrBlobStorage::TEvControllerNodeReport;
+        static constexpr ui32 OldPDiskId = 1;
+        static constexpr ui32 NewPDiskId = 1000;
+        TVector<ui32> Starts;
+        TVector<TReport> Reports;
+        TVector<std::unique_ptr<NPDisk::TEvSlay>> Slays;
+        TTestActorSystem Runtime{1, NLog::PRI_ERROR, MakeIntrusive<TDomainsInfo>()};
+        TActorId WardenId;
+        TActorId SlayObserver;
+        const bool IsStatic;
+        TServiceSet Old;
+        TServiceSet New;
+
+        struct TSubsystem : TNoReplyPDiskSubsystem {
+            TVector<ui32>& Starts;
+            explicit TSubsystem(TVector<ui32>& starts) : Starts(starts) {}
+            void Start(const TActorContext& ctx, ui32 pdiskId, const TIntrusivePtr<TPDiskConfig>& config,
+                    const NPDisk::TMainKey& key, ui32 poolId, ui32 nodeId) override {
+                TNoReplyPDiskSubsystem::Start(ctx, pdiskId, config, key, poolId, nodeId);
+                Starts.push_back(pdiskId);
+            }
+        };
+
+        explicit TPDiskPathCollisionFixture(bool isStatic = false)
+            : IsStatic(isStatic)
+            , Old(MakeServiceSet(OldPDiskId))
+            , New(MakeServiceSet(NewPDiskId))
+        {
+            Runtime.SetupNodeSubSystems = [&](ui32, TActorSystemSetup* setup) {
+                setup->RegisterSubSystem<IPDiskSubsystem>(std::make_unique<TSubsystem>(Starts));
+            };
+            WardenId = SetupNodeWardenForSlayTest(Runtime);
+            SlayObserver = Runtime.AllocateEdgeActor(1);
+            Runtime.WrapInActorContext(WardenId, [&](IActor*) {
+                auto* subsystem = TActivationContext::ActorSystem()->GetSubSystem<IPDiskSubsystem>();
+                static_cast<TSubsystem*>(subsystem)->SetObserver(SlayObserver);
+            });
+            Runtime.FilterEnqueue = [&](ui32, std::unique_ptr<IEventHandle>& ev, ISchedulerCookie*, TInstant) {
+                if (ev->Type == TEvBlobStorage::TEvControllerNodeReport::EventType) {
+                    Reports.push_back(ev->Get<TEvBlobStorage::TEvControllerNodeReport>()->Record);
+                    return false;
+                }
+                if (ev->GetTypeRewrite() == NPDisk::TEvSlay::EventType && ev->Recipient == SlayObserver) {
+                    Slays.emplace_back(ev->Release<NPDisk::TEvSlay>().Release());
+                    return false;
+                }
+                return true;
+            };
+            Apply(Old);
+            WaitForErrorStateVDisk(Runtime, WardenId, {1, OldPDiskId, 1},
+                VDiskIDFromVDiskID(Old.GetVDisks(0).GetVDiskID()));
+        }
+
+        TServiceSet MakeServiceSet(ui32 pdiskId) const {
+            TServiceSet result;
+            auto* pdisk = result.AddPDisks();
+            pdisk->SetNodeID(1);
+            pdisk->SetPDiskID(pdiskId);
+            pdisk->SetPath("/unused-pdisk-path-collision-test");
+            pdisk->SetPDiskGuid(100 + pdiskId);
+            const TGroupID groupId(IsStatic ? EGroupConfigurationType::Static : EGroupConfigurationType::Dynamic, 1, pdiskId);
+            const TVDiskID vdiskId(groupId.GetRaw(), 1, 1, 0, 0);
+            auto* vdisk = result.AddVDisks();
+            VDiskIDFromVDiskID(vdiskId, vdisk->MutableVDiskID());
+            auto* location = vdisk->MutableVDiskLocation();
+            location->SetNodeID(1);
+            location->SetPDiskID(pdiskId);
+            location->SetPDiskGuid(pdisk->GetPDiskGuid());
+            location->SetVDiskSlotID(1);
+            auto* group = result.AddGroups();
+            group->SetGroupID(groupId.GetRaw());
+            group->SetGroupGeneration(1);
+            group->SetErasureSpecies(TBlobStorageGroupType::ErasureMirror3dc);
+            // Error-state actors exercise service startup without issuing recovery I/O to the stub PDisk.
+            for (ui32 realm = 0; realm < 3; ++realm) {
+                auto* ring = group->AddRings();
+                ring->SetState(realm == 1 ? NKikimrBlobStorage::TGroupInfo::TFailRealm::F
+                    : NKikimrBlobStorage::TGroupInfo::TFailRealm::N0);
+                for (ui32 domain = 0; domain < 3; ++domain) {
+                    auto* loc = ring->AddFailDomains()->AddVDiskLocations();
+                    loc->CopyFrom(*location);
+                    if (realm != 1 || domain != 0) {
+                        loc->SetNodeID(2 + realm * 3 + domain);
+                    }
+                }
+            }
+            return result;
+        }
+
+        void Apply(const TServiceSet& serviceSet) {
+            Runtime.WrapInActorContext(WardenId, [&](IActor* actor) {
+                static_cast<TWarden*>(actor)->ApplyServiceSet(serviceSet, IsStatic, true, false, "path collision test");
+            });
+        }
+
+        void Drain() {
+            Runtime.Sim([&] { return Runtime.HasImmediateEvents(); });
+        }
+
+        TServiceSet Replacement(bool destroyOld) const {
+            auto result = New;
+            result.AddGroups()->CopyFrom(Old.GetGroups(0));
+            if (destroyOld) {
+                auto* vdisk = result.AddVDisks();
+                vdisk->CopyFrom(Old.GetVDisks(0));
+                vdisk->SetDoDestroy(true);
+            }
+            return result;
+        }
+
+        void AssertStarted(ui32 pdiskId = NewPDiskId, ui32 expectedStarts = 2) {
+            UNIT_ASSERT_VALUES_EQUAL(Starts.size(), expectedStarts);
+            UNIT_ASSERT_VALUES_EQUAL(Starts.back(), pdiskId);
+            WaitForErrorStateVDisk(Runtime, WardenId, {1, pdiskId, 1},
+                VDiskIDFromVDiskID(MakeServiceSet(pdiskId).GetVDisks(0).GetVDiskID()));
+        }
+
+        void CompleteSlay() {
+            const auto it = FindIf(Slays, [&](const auto& slay) { return slay->PDiskId == NewPDiskId; });
+            UNIT_ASSERT(it != Slays.end());
+            const auto& slay = **it;
+            Runtime.Send(new IEventHandle(WardenId, MakeBlobStoragePDiskID(1, NewPDiskId),
+                new NPDisk::TEvSlayResult(NKikimrProto::OK, 0, slay.VDiskId, slay.SlayOwnerRound,
+                    slay.PDiskId, slay.VSlotId, {})), 1);
+            Drain();
+        }
+
+        ui32 CountRestartReports(ui32 pdiskId = NewPDiskId) const {
+            ui32 count = 0;
+            for (const auto& report : Reports) {
+                for (const auto& item : report.GetPDiskReports()) {
+                    count += item.GetPDiskId() == pdiskId && item.GetPhase() == TReport::PD_RESTARTED;
+                }
+            }
+            return count;
+        }
+
+        ui32 CountVDiskReports(TReport::EVDiskPhase phase) const {
+            ui32 count = 0;
+            for (const auto& report : Reports) {
+                for (const auto& item : report.GetVDiskReports()) {
+                    count += item.GetVSlotId().GetPDiskId() == NewPDiskId && item.GetPhase() == phase;
+                }
+            }
+            return count;
+        }
+    };
+
+    CUSTOM_UNIT_TEST(TestPDiskPathCollisionSingleServiceSet) {
+        for (bool isStatic : {false, true}) {
+            for (bool reverse : {false, true}) {
+                TPDiskPathCollisionFixture f(isStatic);
+                auto replacement = f.Replacement(true);
+                if (reverse) {
+                    replacement.MutableVDisks()->SwapElements(0, 1);
+                }
+                f.Apply(replacement);
+                // No manual disk insertion, destruction or replay of VDisk configuration.
+                f.AssertStarted();
+            }
+        }
     }
 
-    CUSTOM_UNIT_TEST(TestVDiskStartWithPDiskPathCollision) {
-        CheckVDiskStartWithUnavailablePDisk(true);
+    CUSTOM_UNIT_TEST(TestPDiskPathCollisionResumesWithoutVDiskReplay) {
+        TPDiskPathCollisionFixture f;
+        f.Apply(f.Replacement(false));
+        UNIT_ASSERT_VALUES_EQUAL(f.Starts.size(), 1);
+        auto release = f.Replacement(true);
+        release.MutableVDisks()->DeleteSubrange(0, 1); // only the old VDisk's destruction arrives later
+        f.Apply(release);
+        f.AssertStarted();
+    }
+
+    CUSTOM_UNIT_TEST(TestPDiskPathCollisionDefersSlayUntilStart) {
+        for (bool destroy : {false, true}) {
+            TPDiskPathCollisionFixture f;
+            const auto phase = destroy ? TPDiskPathCollisionFixture::TReport::DESTROYED
+                : TPDiskPathCollisionFixture::TReport::WIPED;
+            auto pending = f.Replacement(false);
+            auto* vdisk = pending.MutableVDisks(0);
+            if (destroy) {
+                vdisk->SetDoDestroy(true);
+            } else {
+                vdisk->SetDoWipe(true);
+            }
+            f.Apply(pending);
+            f.Drain();
+            UNIT_ASSERT_VALUES_EQUAL(f.Starts.size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(f.CountVDiskReports(phase), 0);
+            UNIT_ASSERT(f.Slays.empty());
+
+            auto release = f.Replacement(true);
+            release.MutableVDisks()->DeleteSubrange(0, 1);
+            f.Apply(release);
+            f.Drain();
+            UNIT_ASSERT_VALUES_EQUAL(f.Starts.size(), 2);
+            UNIT_ASSERT_VALUES_EQUAL(f.CountVDiskReports(phase), 0);
+            f.CompleteSlay();
+            UNIT_ASSERT_VALUES_EQUAL(f.CountVDiskReports(phase), 1);
+        }
+    }
+
+    CUSTOM_UNIT_TEST(TestPDiskPathCollisionDefersRestartReport) {
+        TPDiskPathCollisionFixture f;
+        auto pending = f.Replacement(false);
+        pending.MutablePDisks(0)->SetEntityStatus(NKikimrBlobStorage::RESTART);
+        f.Apply(pending);
+        f.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(f.CountRestartReports(), 0);
+        auto release = f.Replacement(true);
+        release.MutableVDisks()->DeleteSubrange(0, 1);
+        f.Apply(release);
+        f.AssertStarted();
+        UNIT_ASSERT_VALUES_EQUAL(f.CountRestartReports(), 1);
+    }
+
+    CUSTOM_UNIT_TEST(TestPDiskPathCollisionCancelsRemovedPendingDisk) {
+        for (bool keepOld : {false, true}) {
+            TPDiskPathCollisionFixture f;
+            auto pending = f.Replacement(false);
+            pending.MutablePDisks(0)->SetEntityStatus(NKikimrBlobStorage::RESTART);
+            pending.MutableVDisks(0)->SetDoDestroy(true);
+            f.Apply(pending);
+            UNIT_ASSERT_VALUES_EQUAL(f.CountVDiskReports(TPDiskPathCollisionFixture::TReport::DESTROYED), 0);
+            auto cancel = keepOld ? f.Old : f.Replacement(true);
+            if (!keepOld) {
+                cancel.ClearPDisks();
+                cancel.MutableVDisks()->DeleteSubrange(0, 1);
+            }
+            f.Apply(cancel);
+            f.Drain();
+            UNIT_ASSERT_VALUES_EQUAL(f.Starts.size(), 1); // cancelled replacement must never start
+            UNIT_ASSERT_VALUES_EQUAL(f.CountVDiskReports(TPDiskPathCollisionFixture::TReport::DESTROYED), 1); // now genuinely removed
+            UNIT_ASSERT_VALUES_EQUAL(f.CountRestartReports(), 0);
+            if (keepOld) {
+                auto removeOld = f.Old;
+                removeOld.ClearPDisks();
+                removeOld.MutableVDisks(0)->SetDoDestroy(true);
+                f.Apply(removeOld);
+                f.Drain();
+                UNIT_ASSERT_VALUES_EQUAL(f.Starts.size(), 1);
+            }
+        }
+    }
+
+    CUSTOM_UNIT_TEST(TestPDiskPathCollisionReplacesPendingRestartOnReconnect) {
+        TPDiskPathCollisionFixture f;
+        auto pending = f.Replacement(false);
+        pending.MutablePDisks(0)->SetEntityStatus(NKikimrBlobStorage::RESTART);
+        pending.MutableVDisks(0)->SetDoDestroy(true);
+        f.Apply(pending);
+        UNIT_ASSERT_VALUES_EQUAL(f.CountVDiskReports(TPDiskPathCollisionFixture::TReport::DESTROYED), 0);
+
+        // While disconnected, BSC can remove the pending disk and create a different one,
+        // then mark it Restarting. Reconnect supplies that final comprehensive service set.
+        const ui32 replacementId = 1001;
+        auto replacement = f.MakeServiceSet(replacementId);
+        replacement.MutablePDisks(0)->SetEntityStatus(NKikimrBlobStorage::RESTART);
+        replacement.AddGroups()->CopyFrom(f.Old.GetGroups(0));
+        f.Apply(replacement);
+        f.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(f.Starts.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(f.CountVDiskReports(TPDiskPathCollisionFixture::TReport::DESTROYED), 1);
+        UNIT_ASSERT_VALUES_EQUAL(f.CountRestartReports(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(f.CountRestartReports(replacementId), 0);
+
+        replacement.ClearVDisks();
+        replacement.MutablePDisks(0)->ClearEntityStatus();
+        auto* oldVDisk = replacement.AddVDisks();
+        oldVDisk->CopyFrom(f.Old.GetVDisks(0));
+        oldVDisk->SetDoDestroy(true);
+        f.Apply(replacement);
+        f.AssertStarted(replacementId);
+        UNIT_ASSERT_VALUES_EQUAL(f.CountRestartReports(replacementId), 1);
+
+        // BSC allocates the first free PDisk ID. Reusing the cancelled identity on a
+        // free path must not inherit its old waiting/restart/slay state.
+        auto reuse = f.New;
+        reuse.MutablePDisks(0)->SetPath("/unused-reused-pdisk-id-test");
+        reuse.MutablePDisks(0)->SetEntityStatus(NKikimrBlobStorage::RESTART);
+        reuse.AddPDisks()->CopyFrom(replacement.GetPDisks(0));
+        reuse.AddGroups()->CopyFrom(replacement.GetGroups(0));
+        f.Apply(reuse);
+        f.AssertStarted(f.NewPDiskId, 3);
+        UNIT_ASSERT_VALUES_EQUAL(f.CountRestartReports(), 1);
+    }
+
+    CUSTOM_UNIT_TEST(TestPDiskPathCollisionReusesPendingIdWithNewIncarnation) {
+        for (const auto [changeGuid, changePath] : {std::pair{true, true}, {true, false}, {false, true}}) {
+            for (bool destroyPending : {false, true}) {
+                TPDiskPathCollisionFixture f;
+                auto pending = f.Replacement(false);
+                pending.MutablePDisks(0)->SetEntityStatus(NKikimrBlobStorage::RESTART);
+                pending.MutableVDisks(0)->SetDoDestroy(destroyPending);
+                f.Apply(pending);
+
+                // Reconnect can contain a different PDisk incarnation with the same numeric ID,
+                // without an intervening service set that removes the previous incarnation.
+                auto replacement = f.Replacement(false);
+                auto* pdisk = replacement.MutablePDisks(0);
+                if (changePath) {
+                    pdisk->SetPath("/unused-new-pdisk-incarnation-test");
+                }
+                if (changeGuid) {
+                    pdisk->SetPDiskGuid(9999);
+                }
+                pdisk->SetEntityStatus(NKikimrBlobStorage::RESTART);
+                const ui32 groupId = TGroupID(EGroupConfigurationType::Dynamic, 1, 2000).GetRaw();
+                auto* vdisk = replacement.MutableVDisks(0);
+                vdisk->MutableVDiskID()->SetGroupID(groupId);
+                vdisk->MutableVDiskLocation()->SetPDiskGuid(pdisk->GetPDiskGuid());
+                vdisk->SetDoDestroy(!destroyPending);
+                auto* group = replacement.MutableGroups(0);
+                group->SetGroupID(groupId);
+                for (auto& ring : *group->MutableRings()) {
+                    for (auto& domain : *ring.MutableFailDomains()) {
+                        domain.MutableVDiskLocations(0)->SetPDiskGuid(pdisk->GetPDiskGuid());
+                    }
+                }
+                if (!changePath) {
+                    auto* oldVDisk = replacement.AddVDisks();
+                    oldVDisk->CopyFrom(f.Old.GetVDisks(0));
+                    oldVDisk->SetDoDestroy(true);
+                    replacement.MutableVDisks()->SwapElements(0, 1);
+                }
+                f.Apply(replacement);
+                f.Drain();
+                UNIT_ASSERT_VALUES_EQUAL(f.Starts.size(), 2);
+                UNIT_ASSERT_VALUES_EQUAL(f.CountRestartReports(), 1);
+                if (destroyPending) {
+                    UNIT_ASSERT_VALUES_EQUAL(f.CountVDiskReports(TPDiskPathCollisionFixture::TReport::DESTROYED), 1);
+                    WaitForErrorStateVDisk(f.Runtime, f.WardenId, {1, f.NewPDiskId, 1},
+                        VDiskIDFromVDiskID(vdisk->GetVDiskID()));
+                } else {
+                    // The old incarnation's removal must not acknowledge destruction on the new disk.
+                    UNIT_ASSERT_VALUES_EQUAL(f.CountVDiskReports(TPDiskPathCollisionFixture::TReport::DESTROYED), 0);
+                    f.CompleteSlay();
+                    UNIT_ASSERT_VALUES_EQUAL(f.CountVDiskReports(TPDiskPathCollisionFixture::TReport::DESTROYED), 1);
+                }
+
+                replacement.ClearVDisks();
+                replacement.MutablePDisks(0)->ClearEntityStatus();
+                auto* oldVDisk = replacement.AddVDisks();
+                oldVDisk->CopyFrom(f.Old.GetVDisks(0));
+                oldVDisk->SetDoDestroy(true);
+                f.Apply(replacement);
+                f.Drain();
+                UNIT_ASSERT_VALUES_EQUAL(f.Starts.size(), 2); // old pending GUID must never be restarted
+            }
+        }
     }
 
     CUSTOM_UNIT_TEST(TestFailedRealmVDiskStartsInErrorState) {
@@ -2199,21 +2479,7 @@ Y_UNIT_TEST_SUITE(TBlobStorageWardenTest) {
             UNIT_ASSERT(!warden.VDiskIdByActor.empty());
             UNIT_ASSERT(warden.SlayInFlight.empty());
         });
-        const auto deadline = runtime.GetClock() + TDuration::Seconds(5);
-        runtime.Sim([&] {
-            UNIT_ASSERT(runtime.GetClock() < deadline);
-            bool ready = false;
-            runtime.WrapInActorContext(wardenId, [&](IActor* actor) {
-                const auto& warden = *static_cast<TNodeWarden*>(actor);
-                ready = warden.LocalVDisks.at(slot).Status == NKikimrBlobStorage::EVDiskStatus::ERROR;
-            });
-            return !ready;
-        });
-        const auto edge = runtime.AllocateEdgeActor(1);
-        runtime.Send(new IEventHandle(slot.GetVDiskServiceId(), edge,
-            new TEvBlobStorage::TEvVStatus(vdiskId)), 1);
-        const auto response = runtime.WaitForEdgeActorEvent<TEvBlobStorage::TEvVStatusResult>(edge, false);
-        UNIT_ASSERT_VALUES_EQUAL(response->Get()->Record.GetStatus(), NKikimrProto::VDISK_ERROR_STATE);
+        WaitForErrorStateVDisk(runtime, wardenId, slot, vdiskId);
     }
 
     CUSTOM_UNIT_TEST(TestSlayCompletesWhenPDiskIsDestroyedBeforeReply) {

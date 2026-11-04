@@ -438,13 +438,15 @@ namespace NKikimr::NStorage {
             const auto jt = LocalPDisks.find(it->second.RunningPDiskId);
             Y_ABORT_UNLESS(jt != LocalPDisks.end());
             TPDiskRecord& record = jt->second;
+            // A service-set update can replace a non-temporary PDisk too. Its old VDisks
+            // may still hold the path until ApplyServiceSetVDisks processes their removal.
+            PDisksWaitingToStart.insert(pdisk.GetPDiskID());
+            it->second.Pending = pdisk;
             if (record.Temporary) { // this is temporary PDisk spinning, have to wait for it to finish
-                PDisksWaitingToStart.insert(pdisk.GetPDiskID());
-                it->second.Pending = pdisk;
                 if (!record.RefCount) {
                     DestroyLocalPDisk(jt->first.PDiskId);
                 }
-            } else { // incorrect configuration: we are trying to start two different PDisks with the same path
+            } else { // keep the current owner until its configuration and VDisks have been removed
                 YDB_LOG_ERROR("Starting two PDisks with the same path",
                     {"marker", "NW48"},
                     {"path", path},
@@ -587,42 +589,55 @@ namespace NKikimr::NStorage {
                 ProcessShredStatus(cookie, generation, "pdisk has been restarted");
             }
             LocalPDisks.erase(it);
-            PDiskRestartInFlight.erase(pdiskId);
             PDiskToBlobStorageExecutorPool.ReleasePoolId(pdiskId);
+        }
+        PDiskRestartInFlight.erase(pdiskId);
 
-            // mark vdisks still living over this PDisk as destroyed ones
-            for (auto it = LocalVDisks.lower_bound({LocalNodeId, pdiskId, 0}); it != LocalVDisks.end() &&
-                    it->first.NodeId == LocalNodeId && it->first.PDiskId == pdiskId; ++it) {
-                it->second.UnderlyingPDiskDestroyed = true;
-            }
+        // Also applies to a pending PDisk removed from the configuration before it could start.
+        for (auto it = LocalVDisks.lower_bound({LocalNodeId, pdiskId, 0}); it != LocalVDisks.end() &&
+                it->first.NodeId == LocalNodeId && it->first.PDiskId == pdiskId; ++it) {
+            it->second.UnderlyingPDiskDestroyed = true;
+        }
 
-            // A pending slay no longer needs an acknowledgement from a PDisk which has itself been removed.
-            // Complete it here so that a lost TEvSlayResult can't keep the VSlot state forever.
-            for (auto it = SlayInFlight.lower_bound({LocalNodeId, pdiskId, 0});
-                    it != SlayInFlight.end() && it->first.NodeId == LocalNodeId && it->first.PDiskId == pdiskId; ) {
-                const auto current = it++;
-                const TVSlotId vslotId = current->first;
-                const TSlayInFlight slay = current->second;
-                SlayInFlight.erase(current);
-                SendVDiskReport(vslotId, slay.VDiskId,
-                    slay.Action == ESlayAction::DESTROY
-                        ? NKikimrBlobStorage::TEvControllerNodeReport::DESTROYED
-                        : NKikimrBlobStorage::TEvControllerNodeReport::WIPED);
-            }
+        // A pending slay no longer needs an acknowledgement from a PDisk which has itself been removed.
+        // Complete it here so that a lost TEvSlayResult can't keep the VSlot state forever.
+        for (auto it = SlayInFlight.lower_bound({LocalNodeId, pdiskId, 0});
+                it != SlayInFlight.end() && it->first.NodeId == LocalNodeId && it->first.PDiskId == pdiskId; ) {
+            const auto current = it++;
+            const TVSlotId vslotId = current->first;
+            const TSlayInFlight slay = current->second;
+            SlayInFlight.erase(current);
+            SendVDiskReport(vslotId, slay.VDiskId,
+                slay.Action == ESlayAction::DESTROY
+                    ? NKikimrBlobStorage::TEvControllerNodeReport::DESTROYED
+                    : NKikimrBlobStorage::TEvControllerNodeReport::WIPED);
         }
 
         if (pending) {
             PDisksWaitingToStart.erase(pending->GetPDiskID());
             StartLocalPDisk(*pending, false);
 
-            // start VDisks over this one waiting for their turn
             const ui32 actualPDiskId = pending->GetPDiskID();
+            if (const auto it = PDiskRestartInFlight.find(actualPDiskId); it != PDiskRestartInFlight.end() &&
+                    it->second.Phase == TPDiskRestart::EPhase::WaitingForStart) {
+                PDiskRestartInFlight.erase(it);
+                SendPDiskReport(actualPDiskId, NKikimrBlobStorage::TEvControllerNodeReport::PD_RESTARTED);
+            }
+
             const TVSlotId from(LocalNodeId, actualPDiskId, 0);
             const TVSlotId to(LocalNodeId, actualPDiskId, Max<ui32>());
+            // Destroyed VSlots have already left LocalVDisks, but still need their slay acknowledged.
+            for (auto it = SlayInFlight.lower_bound(from); it != SlayInFlight.end() && it->first <= to; ++it) {
+                IssueSlay(it->first, it->second);
+            }
+            // start VDisks over this one waiting for their turn
             for (auto it = LocalVDisks.lower_bound(from); it != LocalVDisks.end() && it->first <= to; ++it) {
                 auto& [key, value] = *it;
                 Y_ABORT_UNLESS(!value.RuntimeData); // they can't be working
-                StartLocalVDiskActor(value);
+                // A reconnect can replace a pending disk's incarnation before its VDisk records are applied.
+                if (value.Config.GetVDiskLocation().GetPDiskGuid() == pending->GetPDiskGuid()) {
+                    StartLocalVDiskActor(value);
+                }
             }
         }
     }
@@ -774,7 +789,7 @@ namespace NKikimr::NStorage {
 
         auto it = LocalPDisks.find(TPDiskKey(LocalNodeId, pdiskId));
         if (it == LocalPDisks.end()) {
-            PDiskRestartInFlight.erase(pdiskId);
+            restartIt->second.Phase = TPDiskRestart::EPhase::WaitingForStart;
 
             YDB_LOG_NOTICE("Restart state carried from previous start, just starting",
                 {"marker", "NW77"},
@@ -783,7 +798,10 @@ namespace NKikimr::NStorage {
             // This can happen if warden didn't handle pdisk's restart before node's restart.
             // In this case, PDisk has EntityStatus::RESTART instead of EntityStatus::INITIAL.
             StartLocalPDisk(pdisk, false);
-            SendPDiskReport(pdiskId, NKikimrBlobStorage::TEvControllerNodeReport::PD_RESTARTED);
+            if (!PDisksWaitingToStart.contains(pdiskId)) {
+                PDiskRestartInFlight.erase(pdiskId);
+                SendPDiskReport(pdiskId, NKikimrBlobStorage::TEvControllerNodeReport::PD_RESTARTED);
+            }
             return;
         }
 
@@ -917,17 +935,36 @@ namespace NKikimr::NStorage {
         }
     }
 
+    void TNodeWarden::PrunePendingPDisks() {
+        THashMap<TPDiskKey, const TServiceSetPDisk*> configuredPDisks;
+        for (const auto& pdisk : StaticServices.GetPDisks()) {
+            configuredPDisks.emplace(TPDiskKey(pdisk), &pdisk);
+        }
+        for (const auto& pdisk : DynamicServices.GetPDisks()) {
+            configuredPDisks.emplace(TPDiskKey(pdisk), &pdisk);
+        }
+        // Do this before any restart/start can overwrite Pending, or any retiring owner can start it.
+        for (auto& [path, record] : PDiskByPath) {
+            if (!record.Pending) {
+                continue;
+            }
+            const auto it = configuredPDisks.find(TPDiskKey(*record.Pending));
+            if (it == configuredPDisks.end() || it->second->GetPDiskGuid() != record.Pending->GetPDiskGuid()
+                    || it->second->GetPath() != path) {
+                // Numeric IDs can be reused while disconnected. Retire the obsolete incarnation's work.
+                const ui32 pdiskId = record.Pending->GetPDiskID();
+                PDisksWaitingToStart.erase(pdiskId);
+                record.Pending.reset();
+                FinishDestroyLocalPDisk(pdiskId);
+            }
+        }
+    }
+
     void TNodeWarden::ApplyServiceSetPDisks() {
         THashSet<TPDiskKey> pdiskToDelete;
-        THashSet<TString> pathsToResetPending;
         for (const auto& [key, value] : LocalPDisks) {
             if (!value.Temporary) { // ignore temporary disks, they are destroyed automatically
                 pdiskToDelete.insert(key);
-            }
-        }
-        for (const auto& [path, record] : PDiskByPath) {
-            if (record.Pending) {
-                pathsToResetPending.insert(path);
             }
         }
 
@@ -972,7 +1009,6 @@ namespace NKikimr::NStorage {
                 StartLocalPDisk(pdisk, false);
             }
             pdiskToDelete.erase(key);
-            pathsToResetPending.erase(pdisk.GetPath());
 
             if (pdisk.HasStop() && pdisk.GetStop()) {
                 const TActorId actorId = MakeBlobStoragePDiskID(LocalNodeId, key.PDiskId);
@@ -993,12 +1029,6 @@ namespace NKikimr::NStorage {
 
         for (const TPDiskKey& key : pdiskToDelete) {
             DestroyLocalPDisk(key.PDiskId);
-        }
-        for (const TString& path : pathsToResetPending) {
-            if (const auto it = PDiskByPath.find(path); it != PDiskByPath.end()) {
-                PDisksWaitingToStart.erase(it->second.Pending->GetPDiskID());
-                it->second.Pending.reset();
-            }
         }
     }
 

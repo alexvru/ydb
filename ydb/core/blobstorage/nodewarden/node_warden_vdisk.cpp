@@ -118,16 +118,7 @@ namespace NKikimr::NStorage {
 
         // find underlying PDisk and determine its media type
         auto pdiskIt = LocalPDisks.find({vslotId.NodeId, vslotId.PDiskId});
-        if (pdiskIt == LocalPDisks.end()) {
-            // Applying the PDisk configuration can refuse a conflicting path. Keep the VDisk
-            // record for a later configuration update instead of starting without its PDisk.
-            YDB_LOG_ERROR("PDisk not found while starting VDisk",
-                {"marker", "NW122"},
-                {"VDiskId", vdisk.GetVDiskId()},
-                {"VSlotId", vslotId},
-                {"PDiskGuid", pdiskGuid});
-            return;
-        }
+        Y_VERIFY_S(pdiskIt != LocalPDisks.end(), "PDiskId# " << vslotId.NodeId << ":" << vslotId.PDiskId << " not found");
         auto& pdisk = pdiskIt->second;
         Y_VERIFY_S(pdisk.Record.GetPDiskGuid() == pdiskGuid, "PDiskId# " << vslotId.NodeId << ":" << vslotId.PDiskId << " PDiskGuid mismatch");
         const NPDisk::EDeviceType deviceType = TPDiskCategory(pdisk.Record.GetPDiskCategory()).Type();
@@ -591,8 +582,10 @@ namespace NKikimr::NStorage {
         const TVSlotId vslotId(loc);
         const auto [it, inserted] = LocalVDisks.try_emplace(vslotId);
         auto& record = it->second;
-        if (!inserted) {
-            // -- check that configuration did not change
+        if (!inserted && (record.Config.GetVDiskLocation().GetPDiskGuid() != loc.GetPDiskGuid()
+                || !record.GetVDiskId().SameExceptGeneration(VDiskIDFromVDiskID(vdisk.GetVDiskID())))) {
+            // A removed pending PDisk's numeric ID may already belong to a new incarnation.
+            record.UnderlyingPDiskDestroyed = false;
         }
 
         record.Config.CopyFrom(vdisk);
@@ -613,9 +606,9 @@ namespace NKikimr::NStorage {
         }
 
         const TPDiskKey pdiskKey(vslotId.NodeId, vslotId.PDiskId);
-        const bool pdiskMissing = !LocalPDisks.contains(pdiskKey);
+        const bool pdiskRemoved = !LocalPDisks.contains(pdiskKey) && !PDisksWaitingToStart.contains(vslotId.PDiskId);
         if (vdisk.GetDoDestroy() || vdisk.GetEntityStatus() == NKikimrBlobStorage::EEntityStatus::DESTROY) {
-            if (record.UnderlyingPDiskDestroyed || pdiskMissing) {
+            if (record.UnderlyingPDiskDestroyed || pdiskRemoved) {
                 PoisonLocalVDisk(record);
                 SlayInFlight.erase(vslotId);
                 SendVDiskReport(vslotId, record.GetVDiskId(), NKikimrBlobStorage::TEvControllerNodeReport::DESTROYED);
@@ -627,7 +620,7 @@ namespace NKikimr::NStorage {
             LocalVDisks.erase(it);
             ApplyServiceSetPDisks(); // destroy unneeded PDisk actors
         } else if (vdisk.GetDoWipe()) {
-            if (pdiskMissing) {
+            if (pdiskRemoved) {
                 PoisonLocalVDisk(record);
                 SlayInFlight.erase(vslotId);
                 SendVDiskReport(vslotId, record.GetVDiskId(), NKikimrBlobStorage::TEvControllerNodeReport::WIPED);
@@ -685,6 +678,10 @@ namespace NKikimr::NStorage {
     }
 
     void TNodeWarden::IssueSlay(const TVSlotId& vslotId, TSlayInFlight& slay) {
+        if (PDisksWaitingToStart.contains(vslotId.PDiskId)) {
+            // FinishDestroyLocalPDisk will issue this command when the replacement gets its path.
+            return;
+        }
         const ui64 round = NextLocalPDiskInitOwnerRound();
         slay.Round = round;
 

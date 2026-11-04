@@ -422,6 +422,7 @@ namespace NKikimr::NStorage {
         void MergeServiceSetPDisks(NProtoBuf::RepeatedPtrField<TServiceSetPDisk> *to,
             const NProtoBuf::RepeatedPtrField<TServiceSetPDisk>& from, TVector<TServiceSetPDisk>& pdisksToRestart);
 
+        void PrunePendingPDisks();
         void ApplyServiceSetPDisks();
 
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -651,7 +652,7 @@ namespace NKikimr::NStorage {
         std::map<TVSlotId, TSlayInFlight> SlayInFlight;
         // PDiskId -> is another restart required after the current restart.
         struct TPDiskRestart {
-            enum class EPhase { WaitingForDDisks, RestartSent };
+            enum class EPhase { WaitingForStart, WaitingForDDisks, RestartSent };
             EPhase Phase = EPhase::WaitingForDDisks;
             bool RequiresAnotherRestart = false;
             ui64 Generation = 0;
