@@ -23,6 +23,7 @@ LIBRARY()
         blob_depot.cpp
         blob_depot.h
         defs.h
+        config.h
         types.h
         events.h
         schema.h

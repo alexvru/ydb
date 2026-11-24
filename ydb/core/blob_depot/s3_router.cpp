@@ -394,26 +394,26 @@ namespace NKikimr::NBlobDepot {
             FlushPendingRequests();
         }
 
-        void RejectRequest(std::unique_ptr<IEventHandle> ev) {
-            YDB_LOG_DEBUG("S3Router has no endpoint yet, rejecting request",
+        void RejectRequest(std::unique_ptr<IEventHandle> ev, TStringBuf reason = "S3 endpoint is not resolved yet") {
+            YDB_LOG_DEBUG("S3Router rejecting request",
                 {"marker", "BDTS32"},
                 {"id", LogId},
                 {"type", ev->GetTypeRewrite()},
-                {"pending", PendingRequests.size()});
-
-            IncCounter(Mon.PendingRejects);
+                {"pending", PendingRequests.size()},
+                {"reason", reason});
 
             auto response = NWrappers::NExternalStorage::MakeErrorResponse(
                 *ev,
                 NWrappers::NExternalStorage::MakeServiceUnavailableError(
                     "ServiceUnavailable",
-                    TStringBuilder() << "S3 endpoint is not resolved yet, id# " << LogId));
+                    TStringBuilder() << reason << ", id# " << LogId));
             Y_ABORT_UNLESS(response);
             Send(ev->Sender, response.release(), 0, ev->Cookie);
         }
 
         void RejectPendingRequest(TPendingRequest&& pending) {
             RecordPendingLatency(pending, TActivationContext::Monotonic());
+            IncCounter(Mon.PendingRejects);
             RejectRequest(std::move(pending.Ev));
         }
 
@@ -607,7 +607,27 @@ namespace NKikimr::NBlobDepot {
             TActivationContext::Send(IEventHandle::Forward(std::move(ev), InnerWrapperId));
         }
 
+        bool MatchesBucket(IEventHandle& ev) const {
+            using namespace NWrappers::NExternalStorage;
+            switch (ev.GetTypeRewrite()) {
+#define CHECK_BUCKET(name) \
+                case TEv##name##Request::EventType: { \
+                    const auto& request = ev.Get<TEv##name##Request>()->GetRequest(); \
+                    return !request.BucketHasBeenSet() || request.GetBucket() == Settings.GetSettings().GetBucket(); \
+                }
+                Y_FOR_EACH_S3_WRAPPER_OP(CHECK_BUCKET)
+#undef CHECK_BUCKET
+                default:
+                    return true;
+            }
+        }
+
         void Forward(STATEFN_SIG) {
+            // A delayed request can reach the replacement router during a namespace migration.
+            // The storage wrapper otherwise replaces the request's bucket with its configured bucket.
+            if (!MatchesBucket(*ev)) {
+                return RejectRequest(std::unique_ptr<IEventHandle>(ev.Release()), "S3 request targets a different bucket");
+            }
             if (InnerWrapperId) {
                 TrackAndForward(std::unique_ptr<IEventHandle>(ev.Release()));
                 return;
@@ -626,6 +646,7 @@ namespace NKikimr::NBlobDepot {
                 return;
             }
 
+            IncCounter(Mon.PendingRejects);
             RejectRequest(std::unique_ptr<IEventHandle>(ev.Release()));
         }
 
