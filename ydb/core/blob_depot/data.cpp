@@ -133,6 +133,8 @@ namespace NKikimr::NBlobDepot {
             std::vector<TS3ObjectKey> deleteS3;
             bool hasS3References = false;
 
+            const ui32 oldHotGeneration = value.HotWriteGeneration;
+            const ui64 oldHotSequence = value.HotWriteSequence;
             const bool uncertainWriteBefore = value.UncertainWrite;
             const bool wasUncertain = value.IsWrittenUncertainly();
             const bool wasGoingToAssimilate = value.GoingToAssimilate;
@@ -294,13 +296,28 @@ namespace NKikimr::NBlobDepot {
             if (hasS3References) {
                 UpdateS3Counters();
             }
+            const bool mappingChanged = outcome == EUpdateOutcome::DROP || value.ValueVersion != valueVersionBefore;
+            if (Self->CoolingIndex) {
+                if (mappingChanged) {
+                    Self->CoolingIndex->UpdateSourceRetry(key, outcome == EUpdateOutcome::DROP ? nullptr : &value);
+                }
+                if (inserted || mappingChanged ||
+                        oldHotGeneration != value.HotWriteGeneration || oldHotSequence != value.HotWriteSequence) {
+                    if (!inserted) {
+                        Self->CoolingIndex->RemoveHotKey(key, oldHotGeneration, oldHotSequence);
+                    }
+                    if (outcome != EUpdateOutcome::DROP) {
+                        Self->CoolingIndex->AddHotKey(key, value);
+                    }
+                }
+            }
+
             if (outcome != EUpdateOutcome::NO_CHANGE &&
                     Self->MoveData.IsBlobMovingInProgress() &&
                     !Self->MoveData.ApplyingIndexUpdate) {
                 const TString binaryKey = key.MakeBinaryKey();
                 if (Self->MoveData.Key && *Self->MoveData.Key == binaryKey &&
-                        Self->MoveData.BlobLocator.HasBlobSeqId() &&
-                        (outcome == EUpdateOutcome::DROP || value.ValueVersion != valueVersionBefore)) {
+                        Self->MoveData.BlobLocator.HasBlobSeqId() && mappingChanged) {
                     Self->MoveData.RecordTouched = true;
                 }
                 if (outcome != EUpdateOutcome::DROP && !Self->MoveData.NeedsAnotherPass &&
@@ -352,7 +369,6 @@ namespace NKikimr::NBlobDepot {
                     }
                     if (wasUncertain && !value.IsWrittenUncertainly()) {
                         UncertaintyResolver->MakeKeyCertain(key);
-                        Self->S3Manager->OnKeyWritten(key, value.ValueChain);
                     }
                     if (wasGoingToAssimilate != value.GoingToAssimilate) {
                         const i64 sign = value.GoingToAssimilate - wasGoingToAssimilate;
@@ -374,6 +390,13 @@ namespace NKikimr::NBlobDepot {
         return it != Data.end() ? &it->second : nullptr;
     }
 
+    void TData::SetHotWriteOrder(TValue& value) {
+        if (Self->HasAsyncS3History()) {
+            value.HotWriteGeneration = Self->Executor()->Generation();
+            value.HotWriteSequence = NextHotWriteSequence++;
+        }
+    }
+
     void TData::UpdateKey(const TKey& key, const NKikimrBlobDepot::TEvCommitBlobSeq::TItem& item,
             NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
         YDB_LOG_DEBUG("UpdateKey",
@@ -391,8 +414,34 @@ namespace NKikimr::NBlobDepot {
                 value.GoingToAssimilate = false;
             }
 
+            value.HotWriteGeneration = 0;
+            value.HotWriteSequence = 0;
+            if (item.HasBlobLocator()) {
+                SetHotWriteOrder(value);
+            }
+
             return EUpdateOutcome::CHANGE;
         }, item);
+    }
+
+    bool TData::ReplaceValueForCooling(const TKey& key, ui32 expectedVersion, const TValueChain& expectedChain,
+            TValueChain replacement, NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
+        const TValue *value = FindKey(key);
+        if (!value || value->GoingToAssimilate || value->IsWrittenUncertainly() || value->ValueVersion != expectedVersion ||
+                !IsSameValueChain(value->ValueChain, expectedChain) || CheckKeyAgainstBarrier(key)) {
+            return false;
+        }
+
+        return UpdateKey(key, txc, cookie, "ReplaceValueForCooling", [&](TValue& value, bool inserted) {
+            Y_ABORT_UNLESS(!inserted && !replacement.empty());
+            value.ValueChain = std::move(replacement);
+            ++value.ValueVersion;
+            value.HotWriteGeneration = 0;
+            value.HotWriteSequence = 0;
+            // A recent in-memory confirmation may still have a pending UncertainWrite column update.
+            NIceDb::TNiceDb(txc.DB).Table<Schema::Data>().Key(key.MakeBinaryKey()).UpdateToNull<Schema::Data::UncertainWrite>();
+            return EUpdateOutcome::CHANGE;
+        });
     }
 
     TData::EMoveDataReplaceResult TData::ReplaceLocatorForMoveData(const TKey& key, ui32 valueChainIndex,
@@ -499,19 +548,52 @@ namespace NKikimr::NBlobDepot {
                 locator->SetFooterLen(0);
                 value.GoingToAssimilate = false;
                 ++value.ValueVersion;
+                SetHotWriteOrder(value);
                 outcome = EUpdateOutcome::CHANGE;
             }
             return outcome;
         });
     }
 
-    void TData::AddToS3Trash(TS3Locator locator, NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
-        NIceDb::TNiceDb(txc.DB).Table<Schema::TrashS3>().Key(locator.Generation, locator.KeyId).Update(
-            NIceDb::TUpdate<Schema::TrashS3::Len>(locator.Len),
+    void TData::TrackPublishedRetriedPut(TS3Locator locator, TInstant retireAt) {
+        const bool inserted = PublishedRetriedS3Puts.emplace(locator.GetObjectKey(), retireAt).second;
+        Y_ABORT_UNLESS(inserted);
+    }
+
+    void TData::FinishCoolingPut(TS3Locator locator, ECoolingPutOutcome outcome, bool published,
+            NTabletFlatExecutor::TTransactionContext& txc, void *cookie) {
+        NIceDb::TNiceDb db(txc.DB);
+        auto stage = db.Table<Schema::CoolingS3Puts>().Key(locator.Generation, locator.KeyId);
+        // Source reads can outlast the original staging window. Cover late attempts from this PUT.
+        const TInstant retireAt = outcome == ECoolingPutOutcome::MayArriveLate ? Self->S3Manager->GetPutWatchRetireAt() : TInstant();
+        if (published && retireAt) {
+            stage.Update(NIceDb::TUpdate<Schema::CoolingS3Puts::RetireAt>(retireAt),
+                NIceDb::TUpdate<Schema::CoolingS3Puts::Published>(true));
+            TrackPublishedRetriedPut(locator, retireAt);
+        } else if (!retireAt) {
+            stage.Delete();
+        }
+        if (!published && outcome != ECoolingPutOutcome::NotStored) {
+            AddToS3Trash(locator, txc, cookie, retireAt);
+        }
+    }
+
+    void TData::AddToS3Trash(TS3Locator locator, NTabletFlatExecutor::TTransactionContext& txc, void *cookie,
+            TInstant retireAt) {
+        NIceDb::TNiceDb db(txc.DB);
+        auto trash = db.Table<Schema::TrashS3>().Key(locator.Generation, locator.KeyId);
+        if (auto it = PublishedRetriedS3Puts.find(locator.GetObjectKey()); it != PublishedRetriedS3Puts.end()) {
+            retireAt = it->second;
+            PublishedRetriedS3Puts.erase(it);
+        }
+        if (retireAt) {
+            Self->S3Manager->EnqueuePutWatch(locator, retireAt, txc);
+        }
+        trash.Update(NIceDb::TUpdate<Schema::TrashS3::Len>(locator.Len),
             NIceDb::TUpdate<Schema::TrashS3::CheckReferences>(false));
         InFlightTrashSize += locator.Len;
         Self->TabletCounters->Simple()[NKikimrBlobDepot::COUNTER_IN_FLIGHT_TRASH_SIZE] = InFlightTrashSize;
-        InFlightTrashS3.emplace(cookie, locator);
+        InFlightTrashS3.emplace(cookie, TS3TrashItem{locator, bool(retireAt)});
     }
 
     void TData::MakeKeyCertain(const TKey& key) {
@@ -553,6 +635,7 @@ namespace NKikimr::NBlobDepot {
             }
 
             void Complete(const TActorContext&) override {
+                Self->S3Manager->MaybeScheduleCooling();
                 if (Self->Data->KeysMadeCertain.empty()) {
                     Self->Data->CommitCertainKeysScheduled = false;
                 } else {
@@ -606,6 +689,9 @@ namespace NKikimr::NBlobDepot {
         if (AccountValueChain(it->second.ValueChain, ES3ReferenceAction::Add,
                 [&](TLogoBlobID id, ui32, ui32) { addRefCount(RefCountBlobs, id); })) {
             UpdateS3Counters();
+        }
+        if (Self->CoolingIndex) {
+            Self->CoolingIndex->AddHotKey(it->first, it->second);
         }
         if (it->second.GoingToAssimilate) {
             Self->TabletCounters->Simple()[NKikimrBlobDepot::COUNTER_BYTES_TO_DECOMMIT] += it->first.GetBlobId().BlobSize();
@@ -1112,7 +1198,8 @@ namespace NKikimr::NBlobDepot {
             Y_ABORT_UNLESS(AllInFlightTrashBlobs.contains(id));
         }
 
-        for (const auto& [cookie, locator] : InFlightTrashS3) {
+        for (const auto& [cookie, item] : InFlightTrashS3) {
+            const auto& locator = item.Locator;
             const bool inserted = refcountS3.try_emplace(locator.GetObjectKey()).second;
             Y_ABORT_UNLESS(inserted);
         }

@@ -46,6 +46,8 @@ message TValue {
     optional bool Public = 4;
     optional bool GoingToAssimilate = 5;
     optional uint32 ValueVersion = 6;
+    optional uint32 HotWriteGeneration = 7;
+    optional uint64 HotWriteSequence = 8;
 }
 
 message TGivenIdRange {

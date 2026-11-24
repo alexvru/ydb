@@ -114,7 +114,10 @@ void TFakeExternalStorage::Execute(TEvHeadObjectRequest::TPtr& ev, const TReplyA
         std::unique_ptr<TEvHeadObjectResponse> result(new TEvHeadObjectResponse(key, std::move(awsOutcome)));
         adapter.Reply(ev->Sender, std::move(result));
     } else {
-        Aws::Utils::Outcome<Aws::S3::Model::HeadObjectResult, Aws::S3::S3Error> awsOutcome;
+        Aws::Client::AWSError<Aws::S3::S3Errors> error(Aws::S3::S3Errors::NO_SUCH_KEY, "NoSuchKey", "key is missing", false);
+        error.SetResponseCode(Aws::Http::HttpResponseCode::NOT_FOUND);
+        Aws::Utils::Outcome<Aws::S3::Model::HeadObjectResult, Aws::S3::S3Error> awsOutcome(
+            Aws::S3::S3Error(std::move(error)));
         std::unique_ptr<TEvHeadObjectResponse> result(new TEvHeadObjectResponse(key, std::move(awsOutcome)));
         adapter.Reply(ev->Sender, std::move(result));
     }

@@ -2,7 +2,6 @@
 
 #include <ydb/core/base/services/blobstorage_service_id.h>
 #include <ydb/core/blob_depot/config.h>
-#include <ydb/core/blob_depot/s3_put_timeout.h>
 #include <ydb/core/blob_depot/s3_error.h>
 #include <ydb/core/blob_depot/s3_router_events.h>
 #include <ydb/core/protos/s3_settings.pb.h>

@@ -89,10 +89,10 @@ namespace NKikimr::NBlobDepot {
                         responseItem->SetErrorReason(errorReason);
                         if (item.HasS3Locator()) {
                             const auto& locator = TS3Locator::FromProto(item.GetS3Locator());
-                            const size_t numErased = agent.S3WritesInFlight.erase(locator);
-                            Y_ABORT_UNLESS(numErased);
-                            Self->S3Manager->AddTrashToCollect(locator);
-                            Self->S3Manager->OnS3WriteInFlightRemoved(/*success=*/false);
+                            if (agent.S3WritesInFlight.erase(locator)) {
+                                Self->S3Manager->AddTrashToCollect(locator);
+                                Self->S3Manager->OnS3WriteInFlightRemoved(/*success=*/false);
+                            }
                         }
                     };
 
