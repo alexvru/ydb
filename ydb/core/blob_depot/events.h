@@ -31,7 +31,9 @@ namespace NKikimr {
             EvPushMetrics,
             EvPrepareWriteS3,
             EvPrepareWriteS3Result,
-            EvRetiredS3SweepComplete = EvPrepareWriteS3Result + 3,
+            EvHotWriteCredit,
+            EvHotWriteCreditResult,
+            EvRetiredS3SweepComplete,
         };
 
         struct TEvRetiredS3SweepComplete : TEventLocal<TEvRetiredS3SweepComplete, EvRetiredS3SweepComplete> {
@@ -84,6 +86,8 @@ namespace NKikimr {
         BLOBDEPOT_EVENT_PB(EvPushMetrics, BytesRead, BytesWritten);
         BLOBDEPOT_EVENT_PB_NO_ARGS(EvPrepareWriteS3);
         BLOBDEPOT_EVENT_PB_NO_ARGS(EvPrepareWriteS3Result);
+        BLOBDEPOT_EVENT_PB_NO_ARGS(EvHotWriteCredit);
+        BLOBDEPOT_EVENT_PB_NO_ARGS(EvHotWriteCreditResult);
 
         template<typename TEvent>
         struct TResponseFor {};
@@ -97,6 +101,7 @@ namespace NKikimr {
         template<> struct TResponseFor<TEvCommitBlobSeq>  { using Type = TEvCommitBlobSeqResult; };
         template<> struct TResponseFor<TEvResolve>        { using Type = TEvResolveResult; };
         template<> struct TResponseFor<TEvPrepareWriteS3> { using Type = TEvPrepareWriteS3Result; };
+        template<> struct TResponseFor<TEvHotWriteCredit>  { using Type = TEvHotWriteCreditResult; };
 
         template<typename TRequestEvent, typename... TArgs>
         static auto MakeResponseFor(TEventHandle<TRequestEvent>& ev, TArgs&&... args) {

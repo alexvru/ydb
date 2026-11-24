@@ -223,7 +223,7 @@ namespace NKikimr::NBlobDepot {
         , Received(received)
         , QueryId(RandomNumber<ui64>())
         , StartTime(TActivationContext::Monotonic())
-        , Deadline(GetQueryDeadline(*Event, false))
+        , Deadline(GetQueryDeadline(*Event, agent.HotWriteCreditEpoch != 0))
         , DeadlineMonotonic(Deadline == TInstant::Max() ? TMonotonic::Max()
             : StartTime + (Deadline - TActivationContext::Now()))
         , QueryWatchdogMapIter(agent.QueryWatchdogMap.emplace(Min(StartTime + WatchdogDuration, DeadlineMonotonic), this))
@@ -382,6 +382,9 @@ namespace NKikimr::NBlobDepot {
         TIntrusiveListItem<TQuery, TExecutingQueries>::Unlink();
         TIntrusiveListItem<TQuery, TPendingBlockChecks>::Unlink();
         TIntrusiveListItem<TQuery, TPendingId>::Unlink();
+        if (Agent.RemoveHotWriteCreditWaiter(this)) {
+            Agent.ProcessHotWriteCreditQueue();
+        }
         Agent.DeletePendingQueries.PushBack(this);
         TRequestSender::ClearRequestsInFlight();
 
