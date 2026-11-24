@@ -4,11 +4,13 @@ namespace NKikimr::NBlobDepot {
 
     using TCoolingIndex = TBlobDepot::TCoolingIndex;
 
-    TCoolingIndex::TCoolingIndex(const TData& data, ui64 tabletId, ui64 hotTargetBytes, ui32 targetObjectBytes)
+    TCoolingIndex::TCoolingIndex(const TData& data, ui64 tabletId, ui64 hotTargetBytes, ui32 targetObjectBytes,
+            ui32 repackBelowLivePercent)
         : Data(data)
         , TabletId(tabletId)
         , HotTargetBytes(hotTargetBytes)
         , TargetObjectBytes(targetObjectBytes)
+        , RepackBelowLivePercent(repackBelowLivePercent)
     {}
 
     void TCoolingIndex::RemoveHotKey(const TData::TKey& key, ui32 generation, ui64 sequence) {
@@ -32,6 +34,15 @@ namespace NKikimr::NBlobDepot {
         }
     }
 
+    void TCoolingIndex::UpdateObjectOccupancy(const TS3ObjectKey& key, ui32 size, ui64 liveBytes) {
+        ColdSelectionNeedsRestart |= ColdSelectionNext && key <= ColdSelectionNext->first;
+        if (liveBytes && liveBytes * 100 < ui64(size) * RepackBelowLivePercent) {
+            SparseS3Objects.insert(key);
+        } else {
+            SparseS3Objects.erase(key);
+        }
+    }
+
     bool TCoolingIndex::HasWork(ui64 waitingBytes) {
         const bool hotWork = !HotKeys.empty() && (Data.GetTotalStoredDataSize() > HotTargetBytes || waitingBytes);
         if (!hotWork) {
@@ -39,15 +50,16 @@ namespace NKikimr::NBlobDepot {
             HotSelectionAfter.reset();
             HotSelectionNeedsRestart = false;
         }
-        return hotWork;
+        return hotWork || !SparseS3Objects.empty();
     }
 
     TCoolingIndex::TPack TCoolingIndex::SelectCoolingPack(ui64 hotBytesNeeded, TMonotonic now, TSchedule schedule) {
         TPack pack;
+        THashSet<TKey> packKeys;
 
         // Return false only when the key must be retried in the next pack.
-        auto appendKey = [&](const TKey& key) {
-            if (CoolingKeysInFlight.contains(key)) {
+        auto appendKey = [&](const TKey& key, bool hot) {
+            if (CoolingKeysInFlight.contains(key) || packKeys.contains(key)) {
                 return true;
             }
             const auto *value = Data.FindKey(key);
@@ -70,7 +82,7 @@ namespace NKikimr::NBlobDepot {
                     size += end - begin;
                 },
             });
-            if (!valid || !size || size > Max<ui32>() || !hotBytes) {
+            if (!valid || !size || size > Max<ui32>() || (hot != bool(hotBytes))) {
                 return true;
             }
             if (pack.Size && pack.Size + size > TargetObjectBytes) {
@@ -79,26 +91,51 @@ namespace NKikimr::NBlobDepot {
             }
 
             pack.Items.push_back({key, value->ValueVersion, {}, pack.Size, ui32(pack.Size + size)});
+            packKeys.insert(key);
             pack.Size += size;
             pack.HotBytes += hotBytes;
             pack.Full = pack.Size >= TargetObjectBytes || pack.Items.size() == MaxKeysPerCoolingPack;
             return true;
         };
 
-        auto it = HotSelectionAfter ? HotKeys.upper_bound(*HotSelectionAfter) : HotKeys.begin();
-        for (size_t visited = 0; it != HotKeys.end(); ++it) {
-            if (visited++ == MaxKeysVisitedPerSelection) {
-                HotSelectionAfter = *std::prev(it);
-                pack.SelectionLimited = true;
-                return pack;
+        if (hotBytesNeeded) {
+            auto it = HotSelectionAfter ? HotKeys.upper_bound(*HotSelectionAfter) : HotKeys.begin();
+            for (size_t visited = 0; it != HotKeys.end(); ++it) {
+                if (visited++ == MaxKeysVisitedPerSelection) {
+                    HotSelectionAfter = *std::prev(it);
+                    pack.SelectionLimited = true;
+                    return pack;
+                }
+                if (!appendKey(std::get<2>(*it), true) || pack.Full || pack.HotBytes >= hotBytesNeeded) {
+                    break;
+                }
             }
-            if (!appendKey(std::get<2>(*it)) || pack.Full || pack.HotBytes >= hotBytesNeeded) {
-                break;
+            HotSelectionAfter.reset();
+            if (std::exchange(HotSelectionNeedsRestart, false)) {
+                schedule(now);
             }
-        }
-        HotSelectionAfter.reset();
-        if (std::exchange(HotSelectionNeedsRestart, false)) {
-            schedule(now);
+        } else {
+            const auto cursor = std::exchange(ColdSelectionNext, std::nullopt);
+            auto object = cursor ? SparseS3Objects.lower_bound(cursor->first) : SparseS3Objects.begin();
+            size_t visited = 0;
+            for (; object != SparseS3Objects.end(); ++object) {
+                const auto& keys = Data.GetS3PartialKeys(*object);
+                auto it = cursor && *object == cursor->first ? keys.find(cursor->second) : keys.begin();
+                if (it == keys.end()) {
+                    it = keys.begin();
+                }
+                for (; it != keys.end(); ++it) {
+                    if (pack.Full || visited == MaxKeysVisitedPerSelection || !appendKey(it->first, false)) {
+                        ColdSelectionNext.emplace(*object, it->first);
+                        pack.SelectionLimited = !pack.Full;
+                        return pack;
+                    }
+                    ++visited;
+                }
+            }
+            if (std::exchange(ColdSelectionNeedsRestart, false)) {
+                schedule(now);
+            }
         }
         return pack;
     }
@@ -150,14 +187,25 @@ namespace NKikimr::NBlobDepot {
         const ui64 needed = Max(targetExcess, waitingBytes);
         TPack pack = SelectHotPack(needed, urgent, now, schedule);
         if (pack.Items.empty()) {
-            return {};
+            if (urgent) {
+                return {};
+            }
+            pack = SelectCoolingPack(0, now, schedule);
+            if (pack.SelectionLimited) {
+                schedule(now);
+            }
+            if (pack.Items.empty()) {
+                return {};
+            }
         }
 
         // The selected mappings cannot change during this actor turn.
         for (auto& item : pack.Items) {
             const auto& value = *Data.FindKey(item.Key);
             item.SourceChain = value.ValueChain;
-            RemoveHotKey(item.Key, value.HotWriteGeneration, value.HotWriteSequence);
+            if (pack.HotBytes) {
+                RemoveHotKey(item.Key, value.HotWriteGeneration, value.HotWriteSequence);
+            }
             const bool inserted = CoolingKeysInFlight.insert(item.Key).second;
             Y_ABORT_UNLESS(inserted);
         }
@@ -166,6 +214,7 @@ namespace NKikimr::NBlobDepot {
     }
 
     void TCoolingIndex::FinishPack(const TPack& pack, std::optional<size_t> failedSource, TMonotonic now) {
+        ColdSelectionNeedsRestart |= ColdSelectionNext.has_value();
         for (const auto& item : pack.Items) {
             CoolingKeysInFlight.erase(item.Key);
             if (const auto* value = Data.FindKey(item.Key)) {

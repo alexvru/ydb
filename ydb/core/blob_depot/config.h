@@ -90,6 +90,9 @@ namespace NKikimr::NBlobDepot {
         if (bufferBytes * async.GetUploadPutsInFlight() > MaxCoolingUploadBufferBytes) {
             return "Concurrent cooling upload buffers must fit within 512 MiB";
         }
+        if (async.GetRepackBelowLivePercent() > 100) {
+            return "RepackBelowLivePercent must be at most 100";
+        }
         return std::nullopt;
     }
 

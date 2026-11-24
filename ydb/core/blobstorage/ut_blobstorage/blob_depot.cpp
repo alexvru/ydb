@@ -2173,11 +2173,11 @@ Y_UNIT_TEST_SUITE(BlobDepot) {
         env.Runtime->FilterFunction = {};
     }
 
-    Y_UNIT_TEST(AsyncS3PacksHotBlobs) {
+    Y_UNIT_TEST(AsyncS3PacksAndRepacks) {
         TEnvironmentSetup env(MakeCoolingTestSettings());
         NKikimrBlobDepot::TS3BackendSettings::TAsyncMode async;
         async.SetTargetObjectBytes(16);
-        const TString bucketName = "async-pack-hot-blobs";
+        const TString bucketName = "async-pack-and-repack";
         const ui32 groupId = CreateS3VirtualGroup(env, bucketName, &async);
         const auto& bucket = Singleton<NWrappers::NExternalStorage::TFakeExternalStorage>()->GetBucket(bucketName);
         const ui64 tabletId = 100500;
@@ -2213,9 +2213,67 @@ Y_UNIT_TEST_SUITE(BlobDepot) {
             nullptr, nullptr, false, true);
         auto collected = CaptureTEvCollectGarbageResult(env, writer, false);
         UNIT_ASSERT_VALUES_EQUAL_C(collected->Get()->Status, NKikimrProto::OK, collected->Get()->ToString());
-        UNIT_ASSERT(bucket.GetObject(objects.front()));
+        WaitForS3Condition(env, [&] { return bucket.GetSize() == 1 && !bucket.GetObject(objects.front()); });
+
+        UNIT_ASSERT(!bucket.GetObject(objects.front()));
+        const auto compacted = bucket.GetObjectKeys();
+        UNIT_ASSERT_VALUES_EQUAL(compacted.size(), 1);
+        const auto remaining = bucket.GetObject(compacted.front());
+        UNIT_ASSERT(remaining);
+        UNIT_ASSERT_VALUES_EQUAL(*remaining, "wxyz");
         UNIT_ASSERT_VALUES_EQUAL(ReadFromS3VirtualGroup(env, reader, groupId, small), "wxyz");
         UNIT_ASSERT_VALUES_EQUAL(CheckS3VirtualGroupIntegrity(env, checker, groupId, small), NKikimrProto::OK);
+    }
+
+    Y_UNIT_TEST(AsyncS3ConcurrentRepacksResumeAtFirstUnconsumedKey) {
+        using namespace NWrappers::NExternalStorage;
+        TEnvironmentSetup env(MakeCoolingTestSettings());
+        auto& runtime = *env.Runtime;
+        const TString bucketName = "concurrent-cold-repacks";
+        NKikimrBlobDepot::TS3BackendSettings::TAsyncMode async;
+        async.SetTargetObjectBytes(73);
+        async.SetRepackBelowLivePercent(0);
+        const ui32 groupId = CreateS3VirtualGroup(env, bucketName, &async);
+        const auto& bucket = Singleton<TFakeExternalStorage>()->GetBucket(bucketName);
+        const auto edge = runtime.AllocateEdgeActor(1);
+        const TLogoBlobID large(100500, 1, 1, 0, 48, 0);
+        const auto small = [&](ui32 i) { return TLogoBlobID(large.TabletID(), 1, 2 + i, 0, 5, 0); };
+        const auto body = [](ui32 i) { return TString(5, 'a' + i); };
+        PutToS3VirtualGroup(env, edge, groupId, large, TString(48, 'x'));
+        for (ui32 i = 0; i < 5; ++i) {
+            PutToS3VirtualGroup(env, edge, groupId, small(i), body(i));
+        }
+        WaitForPublishedS3Range(env, edge, groupId, large, small(4));
+        UNIT_ASSERT_VALUES_EQUAL(bucket.GetSize(), 1);
+        const auto original = bucket.GetObjectKeys().front();
+        SendTEvCollectGarbage(env, edge, groupId, large.TabletID(), 1, 1, large.Channel(), true, 1, 1,
+            nullptr, nullptr, false, true);
+        const auto collected = CaptureTEvCollectGarbageResult(env, edge, false);
+        UNIT_ASSERT_VALUES_EQUAL_C(collected->Get()->Status, NKikimrProto::OK, collected->Get()->ToString());
+
+        std::vector<std::pair<ui32, std::unique_ptr<IEventHandle>>> replies;
+        runtime.FilterFunction = [&](ui32 node, std::unique_ptr<IEventHandle>& ev) {
+            if (ev->GetTypeRewrite() == TEvPutObjectResponse::EventType) {
+                replies.emplace_back(node, std::move(ev));
+                return false;
+            }
+            return true;
+        };
+        async.SetTargetObjectBytes(11); // The third 5-byte key must be retried in the next pack.
+        async.SetRepackBelowLivePercent(50);
+        async.SetUploadPutsInFlight(3);
+        ReconfigureS3Group(env, MakeS3Settings(bucketName, &async));
+        WaitForS3Condition(env, [&] { return replies.size() == 3; });
+        UNIT_ASSERT_VALUES_EQUAL(bucket.GetSize(), 4);
+        runtime.FilterFunction = {};
+        for (auto& [node, reply] : replies) {
+            runtime.Send(std::move(reply), node);
+        }
+        WaitForS3Condition(env, [&] { return !bucket.GetObject(original); });
+        UNIT_ASSERT_VALUES_EQUAL(bucket.GetSize(), 3);
+        for (ui32 i = 0; i < 5; ++i) {
+            UNIT_ASSERT_VALUES_EQUAL(ReadFromS3VirtualGroup(env, edge, groupId, small(i)), body(i));
+        }
     }
 
     Y_UNIT_TEST(AsyncS3RejectsLimitsBelowOneMaximumWrite) {
@@ -2368,6 +2426,7 @@ Y_UNIT_TEST_SUITE(BlobDepot) {
         auto& runtime = *env.Runtime;
         NKikimrBlobDepot::TS3BackendSettings::TAsyncMode async;
         async.SetTargetObjectBytes(16);
+        async.SetRepackBelowLivePercent(0);
         const TString bucketName = "async-replay-during-recovery";
         const ui32 groupId = CreateS3VirtualGroup(env, bucketName, &async);
         const auto tabletId = TryGetBlobDepotTabletId(env, groupId);
