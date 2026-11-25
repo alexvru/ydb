@@ -181,6 +181,7 @@ namespace NKikimr::NBlobDepot {
                 fFunc(TEvPrivate::EvUploadResult, S3Manager->Handle);
                 fFunc(TEvPrivate::EvDeleteResult, S3Manager->Handle);
                 fFunc(TEvPrivate::EvScanFound, S3Manager->Handle);
+                fFunc(TEvPrivate::EvResumeS3Scan, S3Manager->Handle);
                 fFunc(TEvPrivate::EvDeleteThrottleWakeup, S3Manager->Handle);
                 fFunc(TEvPrivate::EvPutThrottleWakeup, S3Manager->Handle);
 

@@ -17,6 +17,11 @@ namespace NKikimr::NBlobDepot {
     // messages from clients (tablet + agents that talk to that tablet on this node).
     IActor* CreateBlobDepotS3Router(NKikimrBlobDepot::TS3BackendSettings settings, ui64 tabletId);
 
+    // A retirement sweep owns its router and shares cleanup workers and metrics across retired tablets.
+    inline IActor* CreateRetiredS3Router(NKikimrBlobDepot::TS3BackendSettings settings) {
+        return CreateBlobDepotS3Router(std::move(settings), 0);
+    }
+
     IActor* CreateRetiredS3Sweep(TActorId parent, ui64 tabletId, const NKikimrBlobDepot::TBlobDepotConfig& config);
 
 } // NKikimr::NBlobDepot

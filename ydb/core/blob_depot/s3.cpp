@@ -71,6 +71,7 @@ namespace NKikimr::NBlobDepot {
         STRICT_STFUNC_BODY(
             fFunc(TEvPrivate::EvDeleteResult, HandleDeleter)
             fFunc(TEvPrivate::EvScanFound, HandleScanner)
+            cFunc(TEvPrivate::EvResumeS3Scan, OnDataLoaded)
             cFunc(TEvPrivate::EvDeleteThrottleWakeup, HandleDeleteThrottleWakeup)
             cFunc(TEvPrivate::EvPutThrottleWakeup, HandlePutThrottleWakeup)
         )
