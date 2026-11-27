@@ -323,6 +323,7 @@ message TEvNodeConfigInvokeOnRoot {
         optional string PeerName = 7;
         bool DryRun = 8;
         bool AllowUnknownFields = 9;
+        repeated string ConfirmS3RouteChangeForPiles = 10;
     }
 
     message TBootstrapCluster {

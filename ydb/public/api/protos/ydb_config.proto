@@ -98,6 +98,9 @@ message ReplaceConfigRequest {
     //         or overwrite other users changes in case of race
     // Behaviour identical to deprecated DynConfig.SetConfig() call
     bool bypass_checks = 8;
+
+    // For each named backup pile, the new S3 route addresses the same stored objects and in-flight writes.
+    repeated string confirm_s3_route_change_for_piles = 9;
 }
 
 message ReplaceConfigResponse {

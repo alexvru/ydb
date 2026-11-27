@@ -2080,6 +2080,10 @@ bool NKikimr::NStorage::DeriveStorageConfig(const NKikimrConfig::TAppConfig& app
     if (appConfig.HasBridgeConfig()) {
         const auto& p = appConfig.GetBridgeConfig().GetPiles();
         for (int i = 0; i < p.size(); ++i) {
+            if (const auto error = NStorage::ValidateBackupPileConfig(p[i].GetType(), p[i].HasBackup() ? &p[i].GetBackup() : nullptr)) {
+                *errorReason = TStringBuilder() << "pile '" << p[i].GetName() << "': " << *error;
+                return false;
+            }
             if (!p[i].HasName()) {
                 *errorReason = "missing pile name";
                 return false;

@@ -7,6 +7,7 @@
 #include <ydb/core/util/address_classifier.h>
 
 #include <ydb/library/aclib/aclib.h>
+#include <google/protobuf/util/message_differencer.h>
 
 #define YDB_LOG_THIS_FILE_COMPONENT BS_NODE
 
@@ -318,6 +319,16 @@ namespace NKikimr::NStorage {
             throw TExError() << "Use ApplyDataCenterStates to change DC availability";
         }
         CheckStaticGroupStateUpdate(proposed);
+        const auto& currentPiles = current.GetClusterStateDetails().GetPileRegistry().GetPiles();
+        const auto& nextPiles = proposed.GetClusterStateDetails().GetPileRegistry().GetPiles();
+        for (int i = 0; i < Max(currentPiles.size(), nextPiles.size()); ++i) {
+            const bool hasBackup = i < currentPiles.size() && currentPiles.Get(i).GetType() == NKikimrBridge::BACKUP;
+            const bool willHaveBackup = i < nextPiles.size() && nextPiles.Get(i).GetType() == NKikimrBridge::BACKUP;
+            if (hasBackup != willHaveBackup || (hasBackup &&
+                    !google::protobuf::util::MessageDifferencer::Equals(currentPiles.Get(i), nextPiles.Get(i)))) {
+                throw TExError() << "Use cluster config replace to change backup pile configuration";
+            }
+        }
         StartProposition(request->MutableConfig());
     }
 
