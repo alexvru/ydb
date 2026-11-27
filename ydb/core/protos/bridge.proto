@@ -1,10 +1,19 @@
 syntax = "proto3";
 
+import "ydb/core/protos/blob_depot_config.proto";
+
 package NKikimrBridge;
 
 enum EPileType {
     REGULAR = 0;
     BACKUP = 1;
+}
+
+message TBackupPileConfig {
+    repeated NKikimrBlobDepot.TChannelProfile ChannelProfiles = 1;
+    oneof Backend {
+        NKikimrBlobDepot.TS3BackendSettings S3 = 2;
+    }
 }
 
 message TClusterState {
